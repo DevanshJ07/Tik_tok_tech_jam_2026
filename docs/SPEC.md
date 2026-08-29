@@ -277,3 +277,16 @@ Additional rules:
 - An empty prediction file is rejected.
 - Records that identify themselves as mock data are rejected and MUST NOT be reported as model performance.
 - Metrics written by the evaluator MUST be computed from these records (see §15).
+
+## 17. Application interface
+
+The Streamlit shell (`app.py`) is a screening UI over the shared `Predictor` interface. It is not a legal authenticity authority.
+
+- Predictors are created only through `src/inference/factory.py`.
+- `create_predictor(mock=False)` MUST raise `RealModelUnavailableError` until `TraceLensPredictor` is connected at the documented connection point in that module.
+- `create_predictor(mock=True)` MAY return testing-only `MockPredictor`.
+- Callers MUST NOT catch `RealModelUnavailableError` and silently substitute mock mode.
+- Official download JSON remains exactly `image_path` and `pred` (§11).
+- Optional manipulation/reliability fields belong only in detailed/internal display records.
+- Heatmaps are shown only when `PredictionResult.heatmap_path` points to an existing file. The UI MUST NOT generate a fabricated heatmap.
+- Mock mode is off by default and requires a second explicit acknowledgement that results are not model predictions.
