@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from conftest import raw_record
+from tests.conftest import raw_record
 from src.data import manifests
 from src.data.dataset import MissingMaskError, TraceLensDataset
 from src.data.manifests import ProtectedDataError, build_manifest, assign_splits, validate_manifest, ManifestValidationError
