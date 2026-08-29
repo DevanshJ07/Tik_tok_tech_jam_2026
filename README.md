@@ -4,7 +4,7 @@ TraceLens-R is a hackathon-scale image-forensics prototype for TikTok TechJam Pr
 
 ## Current development status
 
-Shared repository foundation, configuration loader, prediction-result contract, and testing-only mock directory inference. The real model, training, evaluation metrics, and application UI are not implemented yet.
+Shared repository foundation, configuration loader, prediction-result contract, testing-only mock directory inference, and an internal labelled AIGC evaluation engine. The real model, training, and application UI are not implemented yet.
 
 ## Mock inference (testing only)
 
@@ -13,6 +13,18 @@ The real model is not wired. Directory-to-JSON inference refuses to run unless `
 ```
 python scripts/predict_directory.py --input_dir <directory> --output_json <file> --mock
 ```
+
+Official inference JSON contains only `image_path` and `pred`. It is not a labelled evaluation file.
+
+## Internal evaluation
+
+Score labelled prediction CSV/JSON (not official inference JSON, and not mock data):
+
+```
+python scripts/evaluate.py --predictions <csv-or-json> --output_dir <directory> --threshold 0.5
+```
+
+Writes `summary.json`, `by_condition.csv`, `by_family.csv`, and `errors.csv`. Every reported metric is computed from the input file.
 
 ## Member responsibilities
 

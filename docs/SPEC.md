@@ -252,3 +252,28 @@ Allowed:
 - Explicitly labelled non-results such as “not yet evaluated”
 
 If a metric cannot be computed, omit it or mark it unevaluated. Do not fabricate a value.
+
+## 16. Internal evaluation-record schema
+
+This schema is **not** the official inference JSON. Official inference output remains exactly `image_path` and `pred` (§11) and MUST be rejected as an evaluation input.
+
+Internal labelled evaluation records (CSV or a JSON list of objects) are the only valid input to `src/evaluation/` and `scripts/evaluate.py`. Each record MUST contain:
+
+| Field | Constraint |
+| --- | --- |
+| `image_path` | Non-empty string |
+| `label` | Integer, exactly `0` (authentic) or `1` (fully synthetic) |
+| `pred` | Finite number in `[0, 1]` |
+| `model_name` | Non-empty string |
+| `dataset` | Non-empty string |
+| `split` | Non-empty string |
+| `transform_name` | One of: `clean`, `jpeg`, `gaussian_blur`, `resize`, `gaussian_noise`, `color_jitter`, `center_crop` |
+| `severity` | String or number; clean records may use `none` |
+
+Additional rules:
+
+- Label `2` (locally tampered) is not a valid AIGC-evaluation label in this file.
+- Duplicate rows for the same `model_name`, `dataset`, `split`, `image_path`, `transform_name`, and `severity` are rejected.
+- An empty prediction file is rejected.
+- Records that identify themselves as mock data are rejected and MUST NOT be reported as model performance.
+- Metrics written by the evaluator MUST be computed from these records (see §15).
