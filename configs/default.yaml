@@ -1,0 +1,50 @@
+seed: 42
+
+model:
+  image_size: 224
+  patch_grid_size: 16
+  embedding_dimension: 384
+  backbone_name: facebook/dinov2-small
+  backbone_frozen: true
+  global_weight: 0.5
+  patch_weight: 0.5
+
+dataset:
+  labels:
+    authentic: 0
+    fully_synthetic: 1
+    locally_tampered: 2
+  aigc_task_labels: [0, 1]
+  manipulation_task_labels: [0, 2]
+  protected_datasets:
+    - wildfake_demonstration
+  never_use_protected_for:
+    - training
+    - calibration
+    - threshold_selection
+    - model_selection
+
+preprocessing:
+  colour_space: RGB
+  resize: 224
+  normalization:
+    name: imagenet_dinov2
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+transforms:
+  jpeg_qualities: [90, 70, 50, 30]
+  gaussian_blur_sigma: [0.5, 1.0, 2.0]
+  resize_factors: [0.5, 0.25]
+  gaussian_noise_sigma: [0.02, 0.05, 0.10]
+  colour_adjustment:
+    brightness: [-0.20, 0.20]
+    contrast: [-0.20, 0.20]
+    saturation: [-0.20, 0.20]
+  centre_crop_retain: 0.80
+
+paths:
+  checkpoints_dir: checkpoints
+  outputs_dir: outputs
+  manifests_dir: data/manifests
+  samples_dir: data/samples

@@ -1,0 +1,47 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Datasets and downloaded images
+datasets/
+data/datasets/
+data/raw/
+data/downloads/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.tif
+*.tiff
+
+# Model checkpoint contents (keep directory via .gitkeep)
+checkpoints/**
+!checkpoints/.gitkeep
+
+# Generated output contents (keep directory via .gitkeep)
+outputs/**
+!outputs/.gitkeep
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE-specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
