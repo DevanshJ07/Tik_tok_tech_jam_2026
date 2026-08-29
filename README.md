@@ -4,7 +4,32 @@ TraceLens-R is a hackathon-scale image-forensics prototype for TikTok TechJam Pr
 
 ## Current development status
 
-Shared repository foundation, configuration loader, prediction-result contract, testing-only mock directory inference, and an internal labelled AIGC evaluation engine. The real model, training, and application UI are not implemented yet.
+Shared contracts, mock directory inference, labelled evaluation, and a Streamlit screening shell. The real model checkpoint is not connected. Reliability, manipulation, and heatmap modules are not connected.
+
+## Installation
+
+```
+python -m pip install -r requirements.txt
+```
+
+## Streamlit application
+
+```
+python -m streamlit run app.py
+```
+
+Mock mode is **off by default** and is testing-only. It requires both the mock toggle and a confirmation checkbox. Mock scores are not model predictions and must not be reported as detection performance. The UI never falls back to mock automatically.
+
+### Connected capabilities
+
+| Capability | Status |
+| --- | --- |
+| AIGC predictor | Not connected. Testing-only `MockPredictor` if mock mode is explicitly enabled and confirmed |
+| Reliability | Not connected |
+| Manipulation | Not connected |
+| Heatmap | Not connected; shown only if a real `heatmap_path` is provided later |
+
+Real inference will be connected in `src/inference/factory.py` after model components are delivered.
 
 ## Mock inference (testing only)
 
