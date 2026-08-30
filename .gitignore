@@ -24,6 +24,9 @@ data/downloads/
 *.bmp
 *.tif
 *.tiff
+*.zip
+*.tar
+*.tar.gz
 
 # Model checkpoint contents (keep directory via .gitkeep)
 checkpoints/**

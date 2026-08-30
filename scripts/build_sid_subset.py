@@ -2,21 +2,32 @@
 """Deterministic, balanced SID-Set operational subset builder.
 
 Streams parquet shards from saberzl/SID_Set (train split) in fixed shard
-order, pinned to a recorded dataset revision. For each shard, deterministically
-(seed-derived) shuffles the shard-local candidate rows per label and takes
-as many as still needed, until every label reaches its target count. Masks
-are exported only for label 2 (locally tampered), matching TraceLens-R's
-label semantics (0=authentic, 1=fully synthetic, 2=locally tampered).
+order, fetched directly against a pinned commit of the dataset's parquet
+export (``PARQUET_REVISION_SHA``) rather than the mutable "current parquet
+conversion" convenience endpoint, so re-running this script always reads the
+same bytes even if the upstream dataset is later re-converted. For each
+shard, deterministically (seed-derived) shuffles the shard-local candidate
+rows per label and takes as many as still needed, until every label reaches
+its target count. Masks are exported only for label 2 (locally tampered),
+matching TraceLens-R's label semantics (0=authentic, 1=fully synthetic,
+2=locally tampered). A label-2 candidate whose mask has no non-zero pixel
+after grayscale conversion is rejected and skipped in favour of the next
+shuffled candidate -- every exported mask is guaranteed non-empty.
 
 This is NOT a uniform reservoir sample over the full 210k-row train split
 (that would require downloading the ~124GB split in full). It is a
 deterministic sample confined to the shards actually needed to fill the
 per-label quotas, processed in a fixed, recorded shard order -- reproducible
-exactly given the same seed, revision, and shard sequence.
+exactly given the same seed, pinned revision, and shard sequence.
 
 The seed is never hardcoded here: it is read from configs/default.yaml
 (top-level "seed" key) via src.config.load_config(), using --repo-root to
 locate that config the same way every other TraceLens-R entry point does.
+
+Every written file is re-read from disk immediately after being written and
+its SHA-256 recomputed to confirm it matches the hash of the in-memory bytes
+that were meant to be written -- this catches disk/filesystem write
+corruption that an in-memory-only checksum would miss.
 
 Usage:
     python scripts/build_sid_subset.py \\
@@ -34,12 +45,14 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
 import requests
 from PIL import Image
 
 REPO = "saberzl/SID_Set"
-REVISION_SHA = "dc03ead57929879319ce30a82bfcfb8d317b10bd"  # pinned dataset repo sha
+DATASET_REPO_SHA = "dc03ead57929879319ce30a82bfcfb8d317b10bd"  # main branch sha, for attribution/provenance only
+PARQUET_REVISION_SHA = "7d1c8a8252aacdf24415d709f9285b2c89e2e039"  # refs/convert/parquet commit -- this is what's actually fetched
 CONFIG_SEED_KEY = "seed"  # top-level key in configs/default.yaml (src.config.load_config contract)
 LABEL_FOLDERS = {0: "authentic", 1: "fully_synthetic", 2: "locally_tampered"}
 MASK_FOLDER = "locally_tampered_masks"
@@ -87,15 +100,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def api_shard_url(index: int) -> str:
-    return f"https://huggingface.co/api/datasets/{REPO}/parquet/default/train/{index}.parquet"
+def pinned_shard_url(index: int) -> str:
+    """URL of parquet shard ``index``, resolved against the pinned commit of
+    the dataset's parquet export -- not the mutable "latest conversion"
+    endpoint -- so the exact bytes fetched are reproducible."""
+    return (
+        f"https://huggingface.co/datasets/{REPO}/resolve/"
+        f"{PARQUET_REVISION_SHA}/default/train/{index:04d}.parquet"
+    )
 
 
 def download_shard(index: int, shard_cache: Path) -> Path:
     dest = shard_cache / f"shard_{index}.parquet"
     if dest.exists() and dest.stat().st_size > 0:
         return dest
-    with requests.get(api_shard_url(index), stream=True, timeout=180) as r:
+    with requests.get(pinned_shard_url(index), stream=True, timeout=180) as r:
         r.raise_for_status()
         tmp = dest.with_suffix(".tmp")
         with open(tmp, "wb") as f:
@@ -107,6 +126,30 @@ def download_shard(index: int, shard_cache: Path) -> Path:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def write_and_verify(path: Path, data: bytes) -> str:
+    """Write ``data`` to ``path``, then re-read it from disk and confirm the
+    on-disk SHA-256 matches the in-memory one. Raises on any mismatch
+    (silent write corruption, truncation, etc.) rather than trusting that a
+    successful ``write_bytes`` call implies correct bytes on disk."""
+    expected = sha256_bytes(data)
+    path.write_bytes(data)
+    actual = sha256_file(path)
+    if actual != expected:
+        raise RuntimeError(
+            f"Checksum mismatch after writing {path}: expected {expected}, got {actual} "
+            "(disk write did not round-trip correctly)"
+        )
+    return expected
 
 
 def ext_for(pil_format: str | None) -> str:
@@ -157,10 +200,11 @@ def main() -> None:
     collected = {label: 0 for label in LABEL_FOLDERS}
     checksums: list[dict] = []
     shard_log: list[dict] = []
+    empty_masks_skipped = 0
 
     shard_idx = 0
     while any(collected[l] < target_per_label for l in LABEL_FOLDERS) and shard_idx < max_shards:
-        print(f"[shard {shard_idx}] downloading...", flush=True)
+        print(f"[shard {shard_idx}] downloading (pinned revision {PARQUET_REVISION_SHA})...", flush=True)
         shard_path = download_shard(shard_idx, shard_cache)
         pf = pq.ParquetFile(shard_path)
         table = pf.read(columns=["label", "img_id", "image", "mask"])
@@ -178,23 +222,46 @@ def main() -> None:
             candidate_indices = [i for i, l in enumerate(labels) if l == label]
             rng = random.Random(stable_seed(seed, "sid_set_operational_subset", label, shard_idx))
             rng.shuffle(candidate_indices)
-            chosen = candidate_indices[:deficit]
 
-            for i in chosen:
+            taken_this_shard = 0
+            for i in candidate_indices:
+                if taken_this_shard >= deficit:
+                    break
+
                 img_id = img_ids[i]
                 assert_not_wildfake(img_id, label)
+
+                mask_png_bytes = None
+                if label == 2:
+                    mask_entry = masks[i]
+                    if mask_entry is None or not mask_entry.get("bytes"):
+                        raise RuntimeError(
+                            f"label=2 row {img_id} in shard {shard_idx} has no mask bytes"
+                        )
+                    mask_pil = Image.open(io.BytesIO(mask_entry["bytes"])).convert("L")
+                    mask_arr = np.array(mask_pil)
+                    if not (mask_arr > 0).any():
+                        # Enforce non-empty label-2 masks: an all-zero mask
+                        # would silently mislabel a tampered image as having
+                        # no tampered region. Reject and try the next
+                        # shuffled candidate instead of counting it.
+                        empty_masks_skipped += 1
+                        continue
+                    mbuf = io.BytesIO()
+                    mask_pil.save(mbuf, format="PNG")
+                    mask_png_bytes = mbuf.getvalue()
+
                 img_bytes = images[i]["bytes"]
                 pil_img = Image.open(io.BytesIO(img_bytes))
-                fmt = pil_img.format
-                ext = ext_for(fmt)
+                ext = ext_for(pil_img.format)
                 safe_id = "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(img_id))
                 out_name = f"{safe_id}{ext}"
                 out_path = output_root / LABEL_FOLDERS[label] / out_name
-                out_path.write_bytes(img_bytes)
+                image_sha256 = write_and_verify(out_path, img_bytes)
                 checksums.append(
                     {
                         "path": f"{LABEL_FOLDERS[label]}/{out_name}",
-                        "sha256": sha256_bytes(img_bytes),
+                        "sha256": image_sha256,
                         "label": label,
                         "img_id": img_id,
                         "kind": "image",
@@ -202,30 +269,22 @@ def main() -> None:
                 )
 
                 if label == 2:
-                    mask_entry = masks[i]
-                    if mask_entry is None or not mask_entry.get("bytes"):
-                        raise RuntimeError(
-                            f"label=2 row {img_id} in shard {shard_idx} has no mask bytes"
-                        )
-                    mask_bytes = mask_entry["bytes"]
-                    mask_pil = Image.open(io.BytesIO(mask_bytes)).convert("L")
                     mask_out_path = output_root / MASK_FOLDER / f"{safe_id}.png"
-                    mbuf = io.BytesIO()
-                    mask_pil.save(mbuf, format="PNG")
-                    mask_png_bytes = mbuf.getvalue()
-                    mask_out_path.write_bytes(mask_png_bytes)
+                    mask_sha256 = write_and_verify(mask_out_path, mask_png_bytes)
                     checksums.append(
                         {
                             "path": f"{MASK_FOLDER}/{safe_id}.png",
-                            "sha256": sha256_bytes(mask_png_bytes),
+                            "sha256": mask_sha256,
                             "label": label,
                             "img_id": img_id,
                             "kind": "mask",
                         }
                     )
 
-            collected[label] += len(chosen)
-            shard_taken[label] = len(chosen)
+                taken_this_shard += 1
+
+            collected[label] += taken_this_shard
+            shard_taken[label] = taken_this_shard
 
         shard_log.append(
             {
@@ -236,7 +295,8 @@ def main() -> None:
             }
         )
         print(
-            f"[shard {shard_idx}] rows={len(labels)} taken={shard_taken} totals={collected}",
+            f"[shard {shard_idx}] rows={len(labels)} taken={shard_taken} totals={collected} "
+            f"empty_masks_skipped_so_far={empty_masks_skipped}",
             flush=True,
         )
 
@@ -251,21 +311,28 @@ def main() -> None:
         json.dumps(
             {
                 "repo": REPO,
-                "revision_sha": REVISION_SHA,
+                "dataset_repo_sha": DATASET_REPO_SHA,
+                "parquet_revision_sha": PARQUET_REVISION_SHA,
+                "parquet_revision_sha_source": "refs/convert/parquet, resolved via "
+                "GET /api/datasets/{repo}/revision/refs%2Fconvert%2Fparquet and pinned "
+                "directly into the download URL (not just recorded after the fact)",
                 "seed": seed,
                 "seed_source": f"configs/default.yaml key '{CONFIG_SEED_KEY}' via src.config.load_config()",
                 "target_per_label": target_per_label,
                 "shards_used": shard_idx,
                 "shard_log": shard_log,
                 "final_counts": collected,
+                "empty_masks_skipped": empty_masks_skipped,
                 "wildfake_check": "every img_id checked against src.data.manifests.is_protected_source() "
                 "and protected-keyword substrings at selection time; none matched",
+                "checksum_verification": "every written file re-read from disk and re-hashed "
+                "immediately after writing; write_and_verify() raises on any mismatch",
             },
             indent=2,
         )
     )
 
-    print("DONE", collected)
+    print("DONE", collected, "empty_masks_skipped:", empty_masks_skipped)
 
 
 if __name__ == "__main__":
