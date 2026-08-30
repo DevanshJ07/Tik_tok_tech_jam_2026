@@ -48,3 +48,7 @@ paths:
   outputs_dir: outputs
   manifests_dir: data/manifests
   samples_dir: data/samples
+
+inference:
+  checkpoint: ""
+  device: cpu

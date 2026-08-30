@@ -283,9 +283,11 @@ Additional rules:
 The Streamlit shell (`app.py`) is a screening UI over the shared `Predictor` interface. It is not a legal authenticity authority.
 
 - Predictors are created only through `src/inference/factory.py`.
-- `create_predictor(mock=False)` MUST raise `RealModelUnavailableError` until `TraceLensPredictor` is connected at the documented connection point in that module.
-- `create_predictor(mock=True)` MAY return testing-only `MockPredictor`.
-- Callers MUST NOT catch `RealModelUnavailableError` and silently substitute mock mode.
+- `create_predictor(mock=False)` MUST construct `TraceLensPredictor` at the documented connection point in that module.
+- A valid Member 2 baseline checkpoint is mandatory for real inference. The path is supplied via `checkpoint=`, `--checkpoint`, or `inference.checkpoint` in the YAML config.
+- A missing, invalid, or incompatible checkpoint MUST raise `RealModelUnavailableError`. Callers MUST NOT catch that error and silently substitute mock mode.
+- `create_predictor(mock=True)` MAY return testing-only `MockPredictor`. Mock mode is never implied and MUST NOT be used as a fallback when the real predictor cannot be constructed.
+- Reliability, manipulation probability, and heatmap remain unavailable (`None`) until Members 3 and 4 attach those modules. Implementations MUST NOT invent those values from the baseline checkpoint.
 - Official download JSON remains exactly `image_path` and `pred` (§11).
 - Optional manipulation/reliability fields belong only in detailed/internal display records.
 - Heatmaps are shown only when `PredictionResult.heatmap_path` points to an existing file. The UI MUST NOT generate a fabricated heatmap.

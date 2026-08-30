@@ -88,3 +88,7 @@ def test_analyse_bytes_cleans_up_and_handles_unavailable_model(tmp_path: Path) -
         resolve_predictor(mock_enabled=False, mock_acknowledged=False)
     with pytest.raises(RealModelUnavailableError):
         analyse_bytes(_png_bytes(), "x.png", create_predictor(mock=False))
+    predictor = resolve_predictor(mock_enabled=True, mock_acknowledged=True)
+    from src.inference.predictor import MockPredictor
+
+    assert isinstance(predictor, MockPredictor)

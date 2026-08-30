@@ -14,6 +14,7 @@ from PIL import Image, UnidentifiedImageError
 from src.inference.contracts import PredictionResult
 from src.inference.factory import create_predictor
 from src.inference.predictor import IMAGE_EXTENSIONS, Predictor
+from src.models.backbone import DINOv2Backbone
 
 SUPPORTED_UPLOAD_EXTENSIONS = IMAGE_EXTENSIONS
 SUPPORTED_UPLOAD_LABEL = "JPG, JPEG, PNG, WEBP, BMP"
@@ -33,7 +34,15 @@ class SavedUpload:
     display_name: str
 
 
-def resolve_predictor(*, mock_enabled: bool, mock_acknowledged: bool) -> Predictor:
+def resolve_predictor(
+    *,
+    mock_enabled: bool,
+    mock_acknowledged: bool,
+    checkpoint: str | Path | None = None,
+    device: str | None = None,
+    config: dict | None = None,
+    backbone: DINOv2Backbone | None = None,
+) -> Predictor:
     """Build a predictor from explicit UI flags. Never implies mock=True."""
     if mock_enabled:
         if not mock_acknowledged:
@@ -42,7 +51,13 @@ def resolve_predictor(*, mock_enabled: bool, mock_acknowledged: bool) -> Predict
                 "results are not model predictions before analysing."
             )
         return create_predictor(mock=True)
-    return create_predictor(mock=False)
+    return create_predictor(
+        mock=False,
+        checkpoint=checkpoint,
+        device=device,
+        config=config,
+        backbone=backbone,
+    )
 
 
 def validate_image_bytes(data: bytes, filename: str | None = None) -> str:

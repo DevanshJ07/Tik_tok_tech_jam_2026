@@ -70,13 +70,14 @@ def test_corrupt_images_are_skipped(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "bad.png" in captured.err
 
 
-def test_missing_mock_fails_clearly(tmp_path: Path) -> None:
+def test_missing_checkpoint_fails_clearly_without_mock_fallback(tmp_path: Path) -> None:
     _write_rgb(tmp_path / "x.png", (9, 9, 9))
     output_json = tmp_path / "preds.json"
     completed = _run_cli("--input_dir", str(tmp_path), "--output_json", str(output_json))
     assert completed.returncode != 0
     combined = completed.stderr + completed.stdout
-    assert "--mock" in combined
+    assert "checkpoint" in combined.lower()
+    assert "not switch to mock" in combined.lower() or "not enabled automatically" in combined.lower()
     assert not output_json.exists()
 
 

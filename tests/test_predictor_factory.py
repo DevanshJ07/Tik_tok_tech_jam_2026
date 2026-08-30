@@ -14,10 +14,18 @@ from src.ui.service import (
 
 
 def test_factory_refuses_silent_mock_fallback() -> None:
-    with pytest.raises(RealModelUnavailableError, match="not yet been integrated"):
+    with pytest.raises(RealModelUnavailableError, match="checkpoint"):
         create_predictor()
     with pytest.raises(RealModelUnavailableError):
         create_predictor(mock=False)
+    with pytest.raises(RealModelUnavailableError):
+        create_predictor(mock=False, config={"inference": {"checkpoint": "", "device": "cpu"}})
+    try:
+        create_predictor(mock=False)
+    except RealModelUnavailableError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("real mode must not return a predictor without a checkpoint")
 
 
 def test_explicit_mock_creation_works() -> None:

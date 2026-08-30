@@ -72,6 +72,9 @@ def test_mock_capabilities_are_testing_only() -> None:
     )
     status = capability_status(mock=True, result=result)
     assert all("testing-only" in value for value in status.values())
-    real_status = capability_status(mock=False, result=result)
-    assert real_status["aigc_predictor"] == "not connected"
-    assert real_status["heatmap"] == "not connected"
+    baseline = PredictionResult(image_path="a.png", aigc_probability=0.4)
+    real_status = capability_status(mock=False, result=baseline)
+    assert real_status["aigc_predictor"] == "connected (baseline)"
+    assert real_status["reliability"] == "awaiting Member 3 model"
+    assert real_status["manipulation"] == "awaiting Member 4 model"
+    assert real_status["heatmap"] == "awaiting Member 4 model"
