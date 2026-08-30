@@ -1,7 +1,7 @@
 """TraceLens-R Streamlit screening shell.
 
-Mock mode is off by default. The real model is not connected yet. This page
-must not fall back to MockPredictor automatically.
+Mock mode is off by default. Real baseline inference uses a configured
+Member 2 checkpoint. This page must not fall back to MockPredictor automatically.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def main() -> None:
     _render_header()
 
     config = _safe_config()
-    mock_enabled, mock_acknowledged, threshold = _render_sidebar(config)
+    mock_enabled, mock_acknowledged, threshold, checkpoint, device = _render_sidebar(config)
 
     if mock_enabled:
         st.markdown(
@@ -61,6 +61,9 @@ def main() -> None:
             mock_enabled=mock_enabled,
             mock_acknowledged=mock_acknowledged,
             threshold=threshold,
+            checkpoint=checkpoint,
+            device=device,
+            config=config,
         )
 
     result_state = st.session_state.get("analysis")
@@ -94,13 +97,36 @@ def _render_header() -> None:
     )
 
 
-def _render_sidebar(config: dict) -> tuple[bool, bool, float]:
+def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str]:
     model = config.get("model", {})
+    inference = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
+    configured_checkpoint = str(inference.get("checkpoint") or "")
+    configured_device = str(inference.get("device") or "cpu")
+    if configured_device not in {"cpu", "cuda"} and not configured_device.startswith("cuda:"):
+        configured_device = "cpu"
+
     st.sidebar.header("Configuration")
     st.sidebar.write(f"**Backbone:** `{model.get('backbone_name', 'unknown')}`")
     st.sidebar.write(f"**Image size:** `{model.get('image_size', 'unknown')}`")
+    checkpoint = st.sidebar.text_input(
+        "Baseline checkpoint",
+        value=configured_checkpoint,
+        help="Path to a Member 2 baseline .pt file. Required for real inference.",
+    )
+    device_options = ["cpu", "cuda"]
+    device_index = 0 if configured_device == "cpu" else 1
+    device = st.sidebar.selectbox(
+        "Device",
+        device_options,
+        index=device_index,
+        help="Safe default is CPU. CUDA is used only when selected here.",
+    )
     threshold = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.01)
     st.sidebar.caption("Display threshold for the provisional model indication. Not a tuned operating point.")
+    st.sidebar.caption(
+        "Reliability and manipulation await Member 3 and Member 4 models. "
+        "They are never invented from the baseline checkpoint."
+    )
 
     st.sidebar.header("Testing-only mock")
     mock_enabled = st.sidebar.toggle("Enable mock mode", value=False)
@@ -114,10 +140,19 @@ def _render_sidebar(config: dict) -> tuple[bool, bool, float]:
             "I acknowledge that mock results are not model predictions",
             value=False,
         )
-    return mock_enabled, mock_acknowledged, float(threshold)
+    return mock_enabled, mock_acknowledged, float(threshold), checkpoint, str(device)
 
 
-def _run_analysis(uploaded, *, mock_enabled: bool, mock_acknowledged: bool, threshold: float) -> None:
+def _run_analysis(
+    uploaded,
+    *,
+    mock_enabled: bool,
+    mock_acknowledged: bool,
+    threshold: float,
+    checkpoint: str,
+    device: str,
+    config: dict,
+) -> None:
     st.session_state.pop("analysis", None)
     if uploaded is None:
         st.error("Upload an image before analysing.")
@@ -127,6 +162,9 @@ def _run_analysis(uploaded, *, mock_enabled: bool, mock_acknowledged: bool, thre
         predictor = resolve_predictor(
             mock_enabled=mock_enabled,
             mock_acknowledged=mock_acknowledged,
+            checkpoint=checkpoint,
+            device=device,
+            config=config,
         )
         result, official_json, detailed_json = analyse_bytes(
             uploaded.getvalue(),
@@ -147,8 +185,9 @@ def _run_analysis(uploaded, *, mock_enabled: bool, mock_acknowledged: bool, thre
         st.error(str(exc))
         st.info(
             "The page remains usable. Upload still works. Mock mode will not "
-            "turn on automatically. After the real checkpoint is integrated, "
-            "analysis will use TraceLensPredictor."
+            "turn on automatically. Set a valid baseline checkpoint path to "
+            "run TraceLensPredictor. Reliability and manipulation stay unavailable "
+            "until those models are connected."
         )
     except (UploadError, PresentationError) as exc:
         st.error(str(exc))
@@ -208,8 +247,9 @@ def _render_capabilities(mock_enabled: bool, result_state: dict | None) -> None:
         }
     )
     st.caption(
-        "Real inference will be connected in src/inference/factory.py after "
-        "model components are delivered. Optional modules must not change AIGC probability."
+        "AIGC uses the Member 2 baseline through src/inference/factory.py. "
+        "Reliability (Member 3) and manipulation / heatmap (Member 4) are awaiting "
+        "their models. Optional modules must not change AIGC probability."
     )
 
 

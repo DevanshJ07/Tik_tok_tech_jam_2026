@@ -132,11 +132,19 @@ def capability_status(*, mock: bool, result: PredictionResult | None = None) -> 
     heatmap_ok = False
     if result is not None:
         heatmap_ok, _ = heatmap_status(result.heatmap_path)
+    reliability_ready = result is not None and result.reliability_score is not None
+    manipulation_ready = result is not None and result.manipulation_probability is not None
     return {
-        "aigc_predictor": "not connected",
-        "reliability": "not connected",
-        "manipulation": "not connected",
-        "heatmap": "connected" if heatmap_ok else "not connected",
+        "aigc_predictor": (
+            "connected (baseline)" if result is not None else "baseline (configure checkpoint)"
+        ),
+        "reliability": (
+            "connected" if reliability_ready else "awaiting Member 3 model"
+        ),
+        "manipulation": (
+            "connected" if manipulation_ready else "awaiting Member 4 model"
+        ),
+        "heatmap": "connected" if heatmap_ok else "awaiting Member 4 model",
     }
 
 
