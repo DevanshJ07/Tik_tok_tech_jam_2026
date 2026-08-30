@@ -39,8 +39,11 @@ Smoke test (no data required)::
 
 Real run from cached features::
 
-    python -m src.training.train_baseline --cache-dir data/cache/features/train \
+    python -m src.training.train_baseline --cache-dir data/cache/features/clean/train \
         --epochs 5 --batch-size 64 --out-dir checkpoints
+
+    python -m src.training.train_baseline --cache-dir data/cache/features \
+        --cache-subset clean --epochs 5 --batch-size 64 --out-dir checkpoints
 
 Real run from a manifest::
 
@@ -66,6 +69,9 @@ from src.models.baseline import EMBED_DIM, NUM_PATCHES, BaselineAIGCDetector
 
 CHECKPOINT_FORMAT_VERSION = 1
 AIGC_LABELS = (0, 1)
+CACHE_GROUP_CLEAN = "clean"
+CACHE_GROUP_TRANSFORMED = "transformed"
+CACHE_GROUPS = (CACHE_GROUP_CLEAN, CACHE_GROUP_TRANSFORMED)
 
 
 # ===========================================================================
@@ -114,6 +120,54 @@ class TrainConfig:
 # ===========================================================================
 # Cached-feature dataset
 # ===========================================================================
+def classify_cache_group(
+    path: Path,
+    record: Dict[str, Any],
+    cache_root: Path,
+) -> Optional[str]:
+    """Return ``clean``, ``transformed``, or ``None`` if the group is unknown.
+
+    Prefers the ``clean/`` vs ``transformed/`` directory layout written by
+    ``scripts/cache_features.py``, then ``transform_name`` in the record.
+    Conflicting path / metadata is an error, not a silent guess.
+    """
+    try:
+        rel_parts = Path(path).resolve().relative_to(Path(cache_root).resolve()).parts
+    except ValueError:
+        rel_parts = Path(path).parts
+    dir_parts = set(rel_parts[:-1])
+    has_clean = CACHE_GROUP_CLEAN in dir_parts
+    has_transformed = CACHE_GROUP_TRANSFORMED in dir_parts
+    if has_clean and has_transformed:
+        raise ValueError(
+            f"{path} sits under both {CACHE_GROUP_CLEAN!r} and "
+            f"{CACHE_GROUP_TRANSFORMED!r} directories"
+        )
+    path_group: Optional[str] = None
+    if has_clean:
+        path_group = CACHE_GROUP_CLEAN
+    elif has_transformed:
+        path_group = CACHE_GROUP_TRANSFORMED
+
+    raw_name = record.get("transform_name")
+    rec_group: Optional[str] = None
+    if raw_name is not None and str(raw_name) != "":
+        rec_group = (
+            CACHE_GROUP_CLEAN if str(raw_name) == CACHE_GROUP_CLEAN else CACHE_GROUP_TRANSFORMED
+        )
+
+    if path_group is not None and rec_group is not None and path_group != rec_group:
+        raise ValueError(
+            f"{path.name}: path group {path_group!r} conflicts with "
+            f"transform_name={raw_name!r}"
+        )
+    return path_group or rec_group
+
+
+class MixedCacheGroupsError(ValueError):
+    """Raised when a cache-dir mixes clean and transformed features."""
+
+
 class CachedFeatureDataset(Dataset):
     """Reads ``.pt`` feature files produced by ``scripts/cache_features.py``.
 
@@ -121,37 +175,79 @@ class CachedFeatureDataset(Dataset):
     ``patch_features [256, 384]`` and ``label``. Files whose label is not in
     ``{0, 1}`` are dropped at construction time (belt-and-braces; the loss
     filter would drop them anyway).
+
+    Clean and transformed caches MUST NOT be mixed unless the caller names
+    exactly one group via ``cache_subset`` (``clean`` or ``transformed``) or
+    points ``cache_dir`` at a single-group directory.
     """
 
-    def __init__(self, cache_dir: str | Path, recursive: bool = True) -> None:
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        recursive: bool = True,
+        cache_subset: Optional[str] = None,
+    ) -> None:
         self.cache_dir = Path(cache_dir)
         if not self.cache_dir.exists():
             raise FileNotFoundError(f"cache-dir does not exist: {self.cache_dir}")
+        if cache_subset is not None:
+            cache_subset = str(cache_subset)
+            if cache_subset not in CACHE_GROUPS:
+                raise ValueError(
+                    f"cache_subset must be one of {CACHE_GROUPS}, got {cache_subset!r}"
+                )
+        self.cache_subset = cache_subset
+
         pattern = "**/*.pt" if recursive else "*.pt"
         all_files = sorted(self.cache_dir.glob(pattern))
         if not all_files:
             raise FileNotFoundError(f"No .pt feature files found under {self.cache_dir}")
 
-        self.files: List[Path] = []
+        classified: List[Tuple[Path, Optional[str]]] = []
         skipped = 0
+        observed_groups = set()
         for fp in all_files:
             try:
-                label = int(torch.load(fp, map_location="cpu", weights_only=False)["label"])
+                rec = torch.load(fp, map_location="cpu", weights_only=False)
+                label = int(rec["label"])
             except Exception as exc:  # noqa: BLE001 - surface but keep going
                 print(f"[cache] WARN: could not read {fp.name}: {exc}")
                 skipped += 1
                 continue
-            if label in AIGC_LABELS:
-                self.files.append(fp)
-            else:
+            group = classify_cache_group(fp, rec, self.cache_dir)
+            if label not in AIGC_LABELS:
                 skipped += 1
+                continue
+            if group is not None:
+                observed_groups.add(group)
+            classified.append((fp, group))
+
+        if (
+            cache_subset is None
+            and CACHE_GROUP_CLEAN in observed_groups
+            and CACHE_GROUP_TRANSFORMED in observed_groups
+        ):
+            raise MixedCacheGroupsError(
+                f"cache-dir {self.cache_dir} mixes {CACHE_GROUP_CLEAN!r} and "
+                f"{CACHE_GROUP_TRANSFORMED!r} features. Pass a single-group "
+                f"directory (e.g. .../{CACHE_GROUP_CLEAN}/train) or set "
+                f"--cache-subset {CACHE_GROUP_CLEAN}|{CACHE_GROUP_TRANSFORMED}."
+            )
+
+        self.files: List[Path] = []
+        for fp, group in classified:
+            if cache_subset is not None and group != cache_subset:
+                skipped += 1
+                continue
+            self.files.append(fp)
+
         if not self.files:
             raise ValueError(
                 f"No usable label-0/1 feature files under {self.cache_dir} "
-                f"({skipped} skipped)."
+                f"(subset={cache_subset!r}, {skipped} skipped)."
             )
         if skipped:
-            print(f"[cache] {len(self.files)} usable files, {skipped} skipped (label 2 / unreadable).")
+            print(f"[cache] {len(self.files)} usable files, {skipped} skipped (label 2 / unreadable / other subset).")
 
     def __len__(self) -> int:
         return len(self.files)
@@ -371,8 +467,12 @@ def _make_generator(seed: int) -> torch.Generator:
     return g
 
 
-def build_feature_source(cache_dir: str, cfg: TrainConfig) -> DataSource:
-    ds = CachedFeatureDataset(cache_dir)
+def build_feature_source(
+    cache_dir: str,
+    cfg: TrainConfig,
+    cache_subset: Optional[str] = None,
+) -> DataSource:
+    ds = CachedFeatureDataset(cache_dir, cache_subset=cache_subset)
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -633,7 +733,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train the TraceLens-R baseline AIGC detector.")
     src = p.add_argument_group("data source (choose one; --smoke works with none)")
     src.add_argument("--cache-dir", type=str, default=None,
-                     help="Directory of cached feature .pt files (see scripts/cache_features.py).")
+                     help="Directory of cached feature .pt files (see scripts/cache_features.py). "
+                          "Must be a single group (clean or transformed) or used with --cache-subset.")
+    src.add_argument("--cache-subset", type=str, default=None, choices=list(CACHE_GROUPS),
+                     help="Required when --cache-dir contains both clean/ and transformed/ features.")
     src.add_argument("--manifest", type=str, default=None, help="Path to a manifest CSV.")
     src.add_argument("--dataset-root", type=str, default=None,
                      help="Root dir that manifest image_path entries resolve against.")
@@ -699,7 +802,7 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     set_seed(cfg.seed)
 
     if args.cache_dir:
-        source = build_feature_source(args.cache_dir, cfg)
+        source = build_feature_source(args.cache_dir, cfg, cache_subset=args.cache_subset)
         summary = train(
             cfg,
             source_kind="features",
