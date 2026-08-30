@@ -1,4 +1,4 @@
-"""Tests for the Stage 1 manipulation branch (Member 4).
+"""Tests for the manipulation branch (Member 4): Stage 1 model + Stage 2 training.
 
 Uses only mock patch features (``torch.randn``) -- this module has no
 dependence on real DINOv2 features or a real backbone.
@@ -9,15 +9,25 @@ from __future__ import annotations
 import pytest
 import torch
 
+from src.data import manifests
 from src.models.manipulation import (
     ManipulationHead,
     patch_logits_to_heatmap,
     topk_manipulation_probability,
 )
+from src.training.train_manipulation import (
+    bce_mask_loss,
+    dice_loss,
+    filter_manipulation_batch,
+    manipulation_loss,
+    resize_mask_to_patch_grid,
+    train_one_epoch,
+)
 
 BATCH_SIZE = 8
 NUM_PATCHES = 256
 EMBEDDING_DIM = 384
+PATCH_GRID_SIZE = 16
 
 
 def make_patch_features(batch_size: int = BATCH_SIZE) -> torch.Tensor:
@@ -171,3 +181,313 @@ def test_no_dependence_on_real_dinov2_features() -> None:
     output = head(torch.randn(2, NUM_PATCHES, EMBEDDING_DIM))
     assert output["manipulation_probability"].shape == (2,)
     assert torch.all(torch.isfinite(output["manipulation_probability"]))
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: mask resizing / alignment
+# ---------------------------------------------------------------------------
+
+
+def test_resize_mask_to_patch_grid_shape() -> None:
+    mask = torch.zeros(BATCH_SIZE, 1, 224, 224)
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+    assert target.shape == (BATCH_SIZE, NUM_PATCHES)
+
+
+def test_resize_mask_to_patch_grid_is_binary() -> None:
+    """Resized targets must remain valid {0,1} manipulation targets."""
+    torch.manual_seed(3)
+    mask = (torch.rand(BATCH_SIZE, 1, 224, 224) > 0.5).float()
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+    unique_values = set(torch.unique(target).tolist())
+    assert unique_values <= {0.0, 1.0}
+
+
+def test_resize_mask_all_zero_stays_all_zero() -> None:
+    mask = torch.zeros(BATCH_SIZE, 1, 224, 224)
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+    assert torch.all(target == 0.0)
+
+
+def test_resize_mask_all_one_stays_all_one() -> None:
+    mask = torch.ones(BATCH_SIZE, 1, 224, 224)
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+    assert torch.all(target == 1.0)
+
+
+def test_resize_mask_preserves_small_sub_patch_manipulated_region() -> None:
+    """A tampered region covering well under 50% of one patch's area must
+    still mark that patch positive (any-pixel-positive semantics, not a
+    majority-vote threshold)."""
+    mask = torch.zeros(1, 1, 224, 224)
+    patch_pixels = 224 // PATCH_GRID_SIZE  # 14
+    row, col = 5, 5
+    row_start, col_start = row * patch_pixels, col * patch_pixels
+    # 2x2 = 4 pixels out of 14x14 = 196 -> ~2% of the patch's area.
+    mask[0, 0, row_start : row_start + 2, col_start : col_start + 2] = 1.0
+
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+
+    positive_patch_index = row * PATCH_GRID_SIZE + col
+    assert target[0, positive_patch_index] == 1.0
+    # No other patch contains any manipulated pixel.
+    assert target.sum().item() == 1.0
+
+
+def test_resize_mask_accepts_batch_hw_without_channel_dim() -> None:
+    mask = torch.zeros(BATCH_SIZE, 224, 224)
+    target = resize_mask_to_patch_grid(mask, patch_grid_size=PATCH_GRID_SIZE)
+    assert target.shape == (BATCH_SIZE, NUM_PATCHES)
+
+
+def test_resize_mask_rejects_bad_rank() -> None:
+    with pytest.raises(ValueError):
+        resize_mask_to_patch_grid(torch.zeros(BATCH_SIZE, 3, 224, 224))
+    with pytest.raises(ValueError):
+        resize_mask_to_patch_grid(torch.zeros(224, 224))
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: BCE / Dice / combined loss
+# ---------------------------------------------------------------------------
+
+
+def test_bce_loss_is_finite() -> None:
+    torch.manual_seed(4)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES, requires_grad=True)
+    target = (torch.rand(BATCH_SIZE, NUM_PATCHES) > 0.5).float()
+    loss = bce_mask_loss(logits, target)
+    assert torch.isfinite(loss)
+    assert loss.shape == ()
+
+
+def test_dice_loss_is_finite() -> None:
+    torch.manual_seed(5)
+    probabilities = torch.sigmoid(torch.randn(BATCH_SIZE, NUM_PATCHES))
+    target = (torch.rand(BATCH_SIZE, NUM_PATCHES) > 0.5).float()
+    loss = dice_loss(probabilities, target)
+    assert torch.isfinite(loss)
+    assert loss.shape == ()
+
+
+def test_dice_loss_handles_all_zero_target_without_nan() -> None:
+    """Authentic (label 0) samples have an all-zero target -- must not NaN."""
+    probabilities = torch.sigmoid(torch.randn(BATCH_SIZE, NUM_PATCHES))
+    target = torch.zeros(BATCH_SIZE, NUM_PATCHES)
+    loss = dice_loss(probabilities, target)
+    assert torch.isfinite(loss)
+    assert not torch.isnan(loss)
+
+
+def test_dice_loss_all_zero_target_and_prediction_is_near_zero() -> None:
+    """A correctly-predicted empty mask should land near zero once smoothed,
+    without special-casing -- confirms the epsilon smoothing behaves sanely
+    rather than merely avoiding a crash."""
+    probabilities = torch.zeros(BATCH_SIZE, NUM_PATCHES)
+    target = torch.zeros(BATCH_SIZE, NUM_PATCHES)
+    loss = dice_loss(probabilities, target)
+    assert torch.isfinite(loss)
+    assert loss.item() < 1e-3
+
+
+def test_combined_manipulation_loss_is_finite_with_pixel_mask() -> None:
+    torch.manual_seed(6)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES)
+    mask = (torch.rand(BATCH_SIZE, 1, 224, 224) > 0.5).float()
+    result = manipulation_loss(logits, mask)
+    assert torch.isfinite(result.total)
+    assert torch.isfinite(result.bce)
+    assert torch.isfinite(result.dice)
+    assert result.total.shape == ()
+    assert result.bce.shape == ()
+    assert result.dice.shape == ()
+
+
+def test_combined_manipulation_loss_equals_bce_plus_dice_by_default() -> None:
+    torch.manual_seed(7)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES)
+    target = (torch.rand(BATCH_SIZE, NUM_PATCHES) > 0.5).float()
+    result = manipulation_loss(logits, target)
+    assert torch.allclose(result.total, result.bce + result.dice)
+
+
+def test_combined_manipulation_loss_handles_all_authentic_batch() -> None:
+    """A batch of only authentic (all-zero mask) samples must not NaN."""
+    torch.manual_seed(8)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES)
+    mask = torch.zeros(BATCH_SIZE, 1, 224, 224)
+    result = manipulation_loss(logits, mask)
+    assert torch.isfinite(result.total)
+
+
+def test_combined_manipulation_loss_handles_all_tampered_batch() -> None:
+    torch.manual_seed(9)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES)
+    mask = torch.ones(BATCH_SIZE, 1, 224, 224)
+    result = manipulation_loss(logits, mask)
+    assert torch.isfinite(result.total)
+
+
+def test_combined_manipulation_loss_handles_mixed_batch() -> None:
+    torch.manual_seed(10)
+    logits = torch.randn(BATCH_SIZE, NUM_PATCHES)
+    mask = torch.zeros(BATCH_SIZE, 1, 224, 224)
+    mask[: BATCH_SIZE // 2] = 1.0  # half tampered, half authentic
+    result = manipulation_loss(logits, mask)
+    assert torch.isfinite(result.total)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: label 1 exclusion
+# ---------------------------------------------------------------------------
+
+
+def test_filter_batch_accepts_label_0() -> None:
+    patch_features = make_patch_features(4)
+    mask = torch.zeros(4, 1, 224, 224)
+    label = torch.full((4,), manifests.LABEL_AUTHENTIC)
+    filtered = filter_manipulation_batch(patch_features, mask, label)
+    assert filtered is not None
+    assert filtered[0].shape[0] == 4
+
+
+def test_filter_batch_accepts_label_2() -> None:
+    patch_features = make_patch_features(4)
+    mask = torch.ones(4, 1, 224, 224)
+    label = torch.full((4,), manifests.LABEL_LOCALLY_TAMPERED)
+    filtered = filter_manipulation_batch(patch_features, mask, label)
+    assert filtered is not None
+    assert filtered[0].shape[0] == 4
+
+
+def test_filter_batch_excludes_label_1() -> None:
+    patch_features = make_patch_features(4)
+    mask = torch.zeros(4, 1, 224, 224)
+    label = torch.full((4,), manifests.LABEL_FULLY_SYNTHETIC)
+    filtered = filter_manipulation_batch(patch_features, mask, label)
+    assert filtered is None
+
+
+def test_filter_batch_mixed_labels_excludes_only_label_1() -> None:
+    patch_features = make_patch_features(6)
+    mask = torch.zeros(6, 1, 224, 224)
+    label = torch.tensor([0, 1, 2, 1, 0, 2])
+
+    filtered_features, filtered_mask, filtered_label = filter_manipulation_batch(
+        patch_features, mask, label
+    )
+
+    assert filtered_label.shape[0] == 4
+    assert torch.all(filtered_label != manifests.LABEL_FULLY_SYNTHETIC)
+    assert set(filtered_label.tolist()) <= {manifests.LABEL_AUTHENTIC, manifests.LABEL_LOCALLY_TAMPERED}
+    assert filtered_features.shape[0] == 4
+    assert filtered_mask.shape[0] == 4
+    # Rows must stay aligned: original indices 0,2,4,5 survive in order.
+    expected_features = patch_features[[0, 2, 4, 5]]
+    assert torch.equal(filtered_features, expected_features)
+
+
+def test_filter_batch_all_label_1_is_handled_explicitly() -> None:
+    """A batch containing only fully-synthetic samples has nothing eligible."""
+    patch_features = make_patch_features(5)
+    mask = torch.zeros(5, 1, 224, 224)
+    label = torch.full((5,), manifests.LABEL_FULLY_SYNTHETIC)
+    assert filter_manipulation_batch(patch_features, mask, label) is None
+
+
+def test_filter_batch_rejects_invalid_label_values() -> None:
+    patch_features = make_patch_features(3)
+    mask = torch.zeros(3, 1, 224, 224)
+    label = torch.tensor([0, 2, 7])
+    with pytest.raises(ValueError):
+        filter_manipulation_batch(patch_features, mask, label)
+
+
+def test_filter_batch_rejects_mismatched_batch_sizes() -> None:
+    patch_features = make_patch_features(4)
+    mask = torch.zeros(3, 1, 224, 224)
+    label = torch.tensor([0, 2, 0, 1])
+    with pytest.raises(ValueError):
+        filter_manipulation_batch(patch_features, mask, label)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: gradient flow and end-to-end mock training
+# ---------------------------------------------------------------------------
+
+
+def test_gradients_flow_through_combined_manipulation_loss() -> None:
+    head = ManipulationHead()
+    patch_features = make_patch_features()
+    mask = (torch.rand(BATCH_SIZE, 1, 224, 224) > 0.5).float()
+
+    output = head(patch_features)
+    result = manipulation_loss(output["patch_mask_logits"], mask)
+    result.total.backward()
+
+    for name, parameter in head.named_parameters():
+        assert parameter.grad is not None, f"no gradient reached {name}"
+        assert torch.any(parameter.grad != 0), f"zero gradient for {name}"
+
+
+def test_train_one_epoch_completes_forward_backward_with_mock_features() -> None:
+    torch.manual_seed(11)
+    head = ManipulationHead()
+    optimizer = torch.optim.SGD(head.parameters(), lr=0.01)
+
+    batches = [
+        {
+            "patch_features": make_patch_features(4),
+            "mask": (torch.rand(4, 1, 224, 224) > 0.5).float(),
+            "label": torch.tensor([0, 2, 0, 2]),
+        },
+        {
+            "patch_features": make_patch_features(4),
+            "mask": torch.zeros(4, 1, 224, 224),
+            "label": torch.tensor([0, 0, 0, 0]),
+        },
+    ]
+
+    stats = train_one_epoch(head, batches, optimizer)
+
+    assert stats.num_batches == 2
+    assert stats.num_skipped_batches == 0
+    assert stats.mean_total_loss == pytest.approx(stats.mean_bce_loss + stats.mean_dice_loss)
+    assert stats.mean_total_loss >= 0.0
+
+
+def test_train_one_epoch_skips_all_label_1_batches() -> None:
+    torch.manual_seed(12)
+    head = ManipulationHead()
+    optimizer = torch.optim.SGD(head.parameters(), lr=0.01)
+
+    batches = [
+        {
+            "patch_features": make_patch_features(4),
+            "mask": torch.zeros(4, 1, 224, 224),
+            "label": torch.tensor([1, 1, 1, 1]),
+        },
+        {
+            "patch_features": make_patch_features(4),
+            "mask": (torch.rand(4, 1, 224, 224) > 0.5).float(),
+            "label": torch.tensor([0, 2, 0, 2]),
+        },
+    ]
+
+    stats = train_one_epoch(head, batches, optimizer)
+    assert stats.num_batches == 1
+    assert stats.num_skipped_batches == 1
+
+
+def test_train_one_epoch_raises_when_nothing_eligible() -> None:
+    head = ManipulationHead()
+    optimizer = torch.optim.SGD(head.parameters(), lr=0.01)
+    batches = [
+        {
+            "patch_features": make_patch_features(4),
+            "mask": torch.zeros(4, 1, 224, 224),
+            "label": torch.tensor([1, 1, 1, 1]),
+        }
+    ]
+    with pytest.raises(ValueError):
+        train_one_epoch(head, batches, optimizer)
