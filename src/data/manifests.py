@@ -42,6 +42,7 @@ DEFAULT_SEED = 42
 # Dataset staging sizes: images per class (label), per spec.
 STAGE_COUNTS_PER_CLASS = {
     "smoke": 100,
+    "operational_1000": 1000,
     "initial": 2000,
     "final": 5000,
 }
