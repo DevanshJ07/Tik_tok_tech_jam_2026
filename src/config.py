@@ -104,6 +104,17 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not _is_non_empty_path_value(outputs_dir):
         raise ConfigError("paths.outputs_dir must be a non-empty path.")
 
+    if "inference" in config:
+        inference = _require_mapping(config, "inference")
+        device = inference.get("device", "cpu")
+        if device is None or not isinstance(device, str) or not device.strip():
+            raise ConfigError("inference.device must be a non-empty string.")
+        if device.strip() != "cpu" and device.strip() != "cuda" and not device.strip().startswith("cuda:"):
+            raise ConfigError("inference.device must be 'cpu' or 'cuda'.")
+        checkpoint = inference.get("checkpoint", "")
+        if checkpoint is not None and not isinstance(checkpoint, (str, Path)):
+            raise ConfigError("inference.checkpoint must be a path string.")
+
 
 def _require_key(mapping: Mapping[str, Any], key: str, prefix: str = "") -> Any:
     if key not in mapping:
