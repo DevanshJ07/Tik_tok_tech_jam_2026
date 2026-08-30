@@ -8,14 +8,16 @@ import pytest
 from PIL import Image
 
 from src.data.transforms import (
-    IDENTITY,
+    CLEAN,
+    TRAINING_COLOR_JITTER,
     TransformSpec,
     apply_center_crop,
+    apply_color_adjustment,
     apply_color_jitter,
     apply_gaussian_blur,
     apply_gaussian_noise,
     apply_jpeg_compression,
-    apply_resize_degrade,
+    apply_resize,
     apply_transform,
     binarize_mask,
     official_transforms,
@@ -53,14 +55,17 @@ def test_official_transforms_match_spec():
 
     assert sorted(by_name["jpeg"]) == [30, 50, 70, 90]
     assert sorted(by_name["gaussian_blur"]) == [0.5, 1.0, 2.0]
-    assert sorted(by_name["resize_degrade"]) == [0.25, 0.5]
+    assert sorted(by_name["resize"]) == [0.25, 0.5]
     assert sorted(by_name["gaussian_noise"]) == [0.02, 0.05, 0.10]
-    assert by_name["color_jitter"] == [0.2]
+    assert sorted(by_name["color_jitter"]) == [0.80, 1.20]
     assert by_name["center_crop"] == [0.8]
-    assert len(specs) == 14
+    assert "identity" not in by_name
+    assert "resize_degrade" not in by_name
+    assert "color_jitter_train" not in by_name
+    assert len(specs) == 15
 
     geometric = {s.name for s in specs if s.is_geometric}
-    assert geometric == {"resize_degrade", "center_crop"}
+    assert geometric == {"resize", "center_crop"}
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +73,7 @@ def test_official_transforms_match_spec():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", official_transforms() + [IDENTITY])
+@pytest.mark.parametrize("spec", official_transforms() + [CLEAN])
 def test_apply_transform_output_is_224(spec: TransformSpec):
     image = _checkerboard_image()
     mask = _quadrant_mask()
@@ -86,7 +91,7 @@ def test_apply_transform_output_is_224(spec: TransformSpec):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", official_transforms() + [IDENTITY])
+@pytest.mark.parametrize("spec", official_transforms() + [CLEAN])
 def test_masks_remain_binary(spec: TransformSpec):
     image = _checkerboard_image()
     mask = _quadrant_mask()
@@ -131,7 +136,7 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     return intersection / union if union else 1.0
 
 
-@pytest.mark.parametrize("spec_name,severity", [("center_crop", 0.8), ("resize_degrade", 0.5), ("resize_degrade", 0.25)])
+@pytest.mark.parametrize("spec_name,severity", [("center_crop", 0.8), ("resize", 0.5), ("resize", 0.25)])
 def test_geometric_transform_keeps_image_mask_aligned(spec_name, severity):
     image = _checkerboard_image()
     mask = _quadrant_mask()
@@ -152,7 +157,7 @@ def test_geometric_transform_keeps_image_mask_aligned(spec_name, severity):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", official_transforms() + [IDENTITY])
+@pytest.mark.parametrize("spec", official_transforms() + [CLEAN])
 def test_transform_metadata_contents(spec: TransformSpec):
     image = _checkerboard_image()
     mask = _quadrant_mask()
@@ -171,7 +176,10 @@ def test_transform_metadata_contents(spec: TransformSpec):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", [TransformSpec("gaussian_noise", 0.05, False), TransformSpec("color_jitter", 0.2, False)])
+@pytest.mark.parametrize(
+    "spec",
+    [TransformSpec("gaussian_noise", 0.05, False), TRAINING_COLOR_JITTER],
+)
 def test_randomized_transforms_are_seed_deterministic(spec: TransformSpec):
     image = _checkerboard_image()
     mask = _quadrant_mask()
@@ -195,15 +203,15 @@ def test_jpeg_and_blur_are_deterministic_regardless_of_rng():
     assert np.array_equal(np.array(out_a), np.array(out_b))
 
 
-def test_identity_leaves_image_unchanged_besides_resize():
+def test_clean_leaves_image_unchanged_besides_resize():
     image = _checkerboard_image(size=(IMAGE_SIZE, IMAGE_SIZE))
     mask = _quadrant_mask(size=(IMAGE_SIZE, IMAGE_SIZE))
 
-    out_image, out_mask, meta = apply_transform(image, mask, IDENTITY, random.Random(5), image_size=IMAGE_SIZE)
+    out_image, out_mask, meta = apply_transform(image, mask, CLEAN, random.Random(5), image_size=IMAGE_SIZE)
 
     assert np.array_equal(np.array(out_image), np.array(image))
-    assert meta["transform_name"] == "identity"
-    assert meta["severity"] is None
+    assert meta["transform_name"] == "clean"
+    assert meta["severity"] == "none"
     assert meta["is_geometric"] is False
 
 
@@ -241,10 +249,10 @@ def test_apply_color_jitter_deterministic_with_seed():
     assert np.array_equal(np.array(a), np.array(b))
 
 
-def test_apply_resize_degrade_shapes():
+def test_apply_resize_shapes():
     image = _checkerboard_image()
     mask = _quadrant_mask()
-    out_image, out_mask = apply_resize_degrade(image, mask, scale=0.25, image_size=IMAGE_SIZE)
+    out_image, out_mask = apply_resize(image, mask, scale=0.25, image_size=IMAGE_SIZE)
     assert out_image.size == (IMAGE_SIZE, IMAGE_SIZE)
     assert out_mask.size == (IMAGE_SIZE, IMAGE_SIZE)
 
@@ -255,3 +263,44 @@ def test_apply_center_crop_shapes():
     out_image, out_mask = apply_center_crop(image, mask, retain=0.8, image_size=IMAGE_SIZE)
     assert out_image.size == (IMAGE_SIZE, IMAGE_SIZE)
     assert out_mask.size == (IMAGE_SIZE, IMAGE_SIZE)
+
+
+def test_evaluation_color_factors_are_deterministic_not_random():
+    image = _checkerboard_image()
+    mask = _quadrant_mask()
+    spec = TransformSpec("color_jitter", 0.80, False)
+    out_a, _, meta = apply_transform(image, mask, spec, random.Random(1), image_size=IMAGE_SIZE)
+    out_b, _, _ = apply_transform(image, mask, spec, random.Random(99), image_size=IMAGE_SIZE)
+    expected = apply_color_adjustment(image, 0.80).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+    assert meta["transform_name"] == "color_jitter"
+    assert meta["severity"] == 0.80
+    assert np.array_equal(np.array(out_a), np.array(out_b))
+    assert np.array_equal(np.array(out_a), np.array(expected))
+
+
+def test_training_color_jitter_is_not_the_official_eval_grid():
+    names = {spec.name for spec in official_transforms()}
+    assert "color_jitter_train" not in names
+    assert TRAINING_COLOR_JITTER.name == "color_jitter_train"
+    image = _checkerboard_image()
+    eval_dark = apply_color_adjustment(image, 0.80)
+    train_a = apply_color_jitter(image, 0.2, random.Random(3))
+    train_b = apply_color_jitter(image, 0.2, random.Random(4))
+    assert not np.array_equal(np.array(train_a), np.array(eval_dark))
+    assert not np.array_equal(np.array(train_a), np.array(train_b))
+
+
+def test_jpeg_runs_before_final_224_resize():
+    image = _checkerboard_image(size=(96, 96))
+    mask = _quadrant_mask(size=(96, 96))
+    spec = TransformSpec("jpeg", 30, False)
+    out_image, out_mask, _ = apply_transform(image, mask, spec, random.Random(0), image_size=IMAGE_SIZE)
+
+    jpeg_then_resize = apply_jpeg_compression(image, 30).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+    resize_then_jpeg = apply_jpeg_compression(
+        image.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR), 30
+    )
+    assert out_image.size == (IMAGE_SIZE, IMAGE_SIZE)
+    assert out_mask.size == (IMAGE_SIZE, IMAGE_SIZE)
+    assert np.array_equal(np.array(out_image), np.array(jpeg_then_resize))
+    assert not np.array_equal(np.array(out_image), np.array(resize_then_jpeg))

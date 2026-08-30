@@ -7,7 +7,12 @@ import pytest
 
 from tests.conftest import raw_record
 from src.data import manifests
-from src.data.dataset import MissingMaskError, TraceLensDataset
+from src.data.dataset import (
+    TASK_AIGC,
+    TASK_MANIPULATION,
+    MissingMaskError,
+    TraceLensDataset,
+)
 from src.data.manifests import ProtectedDataError, build_manifest, assign_splits, validate_manifest, ManifestValidationError
 from src.data.transforms import official_transforms
 
@@ -32,14 +37,14 @@ def _small_balanced_manifest(tmp_path, n_per_class: int = 10) -> pd.DataFrame:
 
 def test_dataset_sample_shapes_and_label(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=10)
-    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path)
+    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_AIGC)
 
     assert len(dataset) > 0
     sample = dataset[0]
 
     assert sample["image"].shape == (3, IMAGE_SIZE, IMAGE_SIZE)
     assert sample["mask"].shape == (1, IMAGE_SIZE, IMAGE_SIZE)
-    assert sample["label"] in manifests.VALID_LABELS
+    assert sample["label"] in (0, 1)
     assert isinstance(sample["image_path"], str)
     assert isinstance(sample["image_id"], str)
 
@@ -47,26 +52,26 @@ def test_dataset_sample_shapes_and_label(tmp_path):
 def test_all_samples_have_valid_labels(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=6)
     for split in manifests.VALID_SPLITS:
-        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path)
+        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path, task=TASK_AIGC)
         for i in range(len(dataset)):
-            assert dataset[i]["label"] in manifests.VALID_LABELS
+            assert dataset[i]["label"] in (0, 1)
 
 
 def test_zero_mask_for_authentic_and_synthetic(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=8)
     for split in manifests.VALID_SPLITS:
-        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path)
+        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path, task=TASK_AIGC)
         for i in range(len(dataset)):
             sample = dataset[i]
             if sample["label"] in (manifests.LABEL_AUTHENTIC, manifests.LABEL_FULLY_SYNTHETIC):
                 assert float(sample["mask"].sum()) == 0.0
 
 
-def test_tampered_mask_is_nonzero_with_identity_transform(tmp_path):
+def test_tampered_mask_is_nonzero_with_clean_transform(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=8)
     found_tampered = False
     for split in manifests.VALID_SPLITS:
-        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path)
+        dataset = TraceLensDataset(df, split=split, dataset_root=tmp_path, task=TASK_MANIPULATION)
         for i in range(len(dataset)):
             sample = dataset[i]
             if sample["label"] == manifests.LABEL_LOCALLY_TAMPERED:
@@ -77,7 +82,13 @@ def test_tampered_mask_is_nonzero_with_identity_transform(tmp_path):
 
 def test_mask_values_are_binary(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=6)
-    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, transform_pool=official_transforms())
+    dataset = TraceLensDataset(
+        df,
+        split="train",
+        dataset_root=tmp_path,
+        task=TASK_MANIPULATION,
+        transform_pool=official_transforms(),
+    )
     for i in range(len(dataset)):
         mask = dataset[i]["mask"]
         values = set(torch_unique(mask))
@@ -90,7 +101,13 @@ def torch_unique(tensor):
 
 def test_transform_metadata_present(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=6)
-    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, transform_pool=official_transforms())
+    dataset = TraceLensDataset(
+        df,
+        split="train",
+        dataset_root=tmp_path,
+        task=TASK_AIGC,
+        transform_pool=official_transforms(),
+    )
     sample = dataset[0]
     metadata = sample["transform_metadata"]
     assert set(metadata.keys()) == {"transform_name", "severity", "is_geometric"}
@@ -105,8 +122,12 @@ def test_dataset_transform_selection_is_deterministic(tmp_path):
     df = _small_balanced_manifest(tmp_path, n_per_class=6)
     pool = official_transforms()
 
-    ds_a = TraceLensDataset(df, split="train", dataset_root=tmp_path, transform_pool=pool, seed=42)
-    ds_b = TraceLensDataset(df, split="train", dataset_root=tmp_path, transform_pool=pool, seed=42)
+    ds_a = TraceLensDataset(
+        df, split="train", dataset_root=tmp_path, task=TASK_AIGC, transform_pool=pool, seed=42
+    )
+    ds_b = TraceLensDataset(
+        df, split="train", dataset_root=tmp_path, task=TASK_AIGC, transform_pool=pool, seed=42
+    )
 
     for i in range(len(ds_a)):
         sample_a, sample_b = ds_a[i], ds_b[i]
@@ -244,7 +265,7 @@ def test_dataset_rejects_manifest_with_protected_row_in_train(tmp_path):
     df.loc[df.index[0], "protected"] = True
 
     with pytest.raises(ProtectedDataError):
-        TraceLensDataset(df, split="train", dataset_root=tmp_path)
+        TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_AIGC)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +280,7 @@ def test_missing_mask_file_raises_explicitly(tmp_path):
     # Point mask_path at a file that doesn't actually exist on disk.
     df.loc[df.index[0], "mask_path"] = str(tmp_path / "does_not_exist.png")
 
-    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path)
+    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_MANIPULATION)
     with pytest.raises(MissingMaskError):
         dataset[0]
 
@@ -271,3 +292,44 @@ def test_null_mask_path_for_tampered_sample_rejected_by_validation(tmp_path):
 
     with pytest.raises(ManifestValidationError):
         validate_manifest(df)
+
+
+# ---------------------------------------------------------------------------
+# Task modes (AIGC 0/1, manipulation 0/2)
+# ---------------------------------------------------------------------------
+
+
+def test_aigc_task_keeps_labels_0_and_1_only(tmp_path):
+    df = _small_balanced_manifest(tmp_path, n_per_class=8)
+    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_AIGC)
+    labels = {dataset[i]["label"] for i in range(len(dataset))}
+    assert labels <= {0, 1}
+    assert 2 not in labels
+
+
+def test_manipulation_task_keeps_labels_0_and_2_only(tmp_path):
+    df = _small_balanced_manifest(tmp_path, n_per_class=8)
+    dataset = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_MANIPULATION)
+    labels = {dataset[i]["label"] for i in range(len(dataset))}
+    assert labels <= {0, 2}
+    assert 1 not in labels
+
+
+def test_task_modes_never_convert_label_2_to_1(tmp_path):
+    df = _small_balanced_manifest(tmp_path, n_per_class=8)
+    aigc = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_AIGC)
+    manipulation = TraceLensDataset(df, split="train", dataset_root=tmp_path, task=TASK_MANIPULATION)
+    assert all(sample["label"] != 2 for sample in (aigc[i] for i in range(len(aigc))))
+    assert all(sample["label"] != 1 for sample in (manipulation[i] for i in range(len(manipulation))))
+    tampered_ids = set(df.loc[df["label"] == 2, "image_id"])
+    returned_ids = {manipulation[i]["image_id"] for i in range(len(manipulation))}
+    assert tampered_ids.intersection(returned_ids)
+    for i in range(len(manipulation)):
+        if manipulation[i]["image_id"] in tampered_ids:
+            assert manipulation[i]["label"] == 2
+
+
+def test_unknown_task_is_rejected(tmp_path):
+    df = _small_balanced_manifest(tmp_path, n_per_class=3)
+    with pytest.raises(ValueError, match="task"):
+        TraceLensDataset(df, split="train", dataset_root=tmp_path, task="both")

@@ -4,10 +4,11 @@ Every transform here is a pure function of (image, mask, parameters, rng) so
 that behaviour is fully deterministic given a seeded ``random.Random``. Rules
 enforced throughout this module (per the shared spec):
 
-  * Pixel-value transforms (JPEG, blur, noise, colour jitter) are NEVER
-    applied to the mask -- only geometric transforms (resize-degrade,
+  * Pixel-value transforms (JPEG, blur, noise, colour) are NEVER
+    applied to the mask -- only geometric transforms (resize,
     centre-crop) touch the mask, and they apply the identical geometry to
-    both image and mask.
+    both image and mask. Pixel-value transforms run on the native image
+    *before* the final 224×224 resize (SPEC §5).
   * Masks are always resized with nearest-neighbour interpolation and
     re-binarized afterwards, so they never pick up intermediate grey values.
   * Every transform ultimately returns an image and mask at the requested
@@ -54,24 +55,32 @@ class TransformSpec:
     is_geometric: bool
 
 
-IDENTITY = TransformSpec(name="identity", severity=None, is_geometric=False)
+CLEAN = TransformSpec(name="clean", severity="none", is_geometric=False)
 
 JPEG_QUALITIES = (90, 70, 50, 30)
 BLUR_SIGMAS = (0.5, 1.0, 2.0)
 RESIZE_SCALES = (0.5, 0.25)
 NOISE_SIGMAS = (0.02, 0.05, 0.10)
 COLOR_JITTER_FRACTION = 0.2
+EVAL_COLOR_FACTORS = (0.80, 1.20)
 CENTER_CROP_RETAIN = 0.8
+TRAINING_COLOR_JITTER = TransformSpec(
+    name="color_jitter_train", severity=COLOR_JITTER_FRACTION, is_geometric=False
+)
 
 
 def official_transforms() -> list[TransformSpec]:
-    """The full grid of official transforms x severities (excludes identity)."""
+    """Official robustness grid (SPEC §12 / §16). Excludes clean.
+
+    Colour entries are the deterministic evaluation factors 0.80 and 1.20.
+    Random training colour jitter is ``TRAINING_COLOR_JITTER``, not this list.
+    """
     specs: list[TransformSpec] = []
     specs += [TransformSpec("jpeg", q, False) for q in JPEG_QUALITIES]
     specs += [TransformSpec("gaussian_blur", s, False) for s in BLUR_SIGMAS]
-    specs += [TransformSpec("resize_degrade", s, True) for s in RESIZE_SCALES]
+    specs += [TransformSpec("resize", s, True) for s in RESIZE_SCALES]
     specs += [TransformSpec("gaussian_noise", s, False) for s in NOISE_SIGMAS]
-    specs += [TransformSpec("color_jitter", COLOR_JITTER_FRACTION, False)]
+    specs += [TransformSpec("color_jitter", factor, False) for factor in EVAL_COLOR_FACTORS]
     specs += [TransformSpec("center_crop", CENTER_CROP_RETAIN, True)]
     return specs
 
@@ -123,8 +132,19 @@ def apply_gaussian_noise(image: Image.Image, sigma: float, rng: random.Random) -
     return Image.fromarray((noisy * 255.0).round().astype(np.uint8), mode="RGB")
 
 
+def apply_color_adjustment(image: Image.Image, factor: float) -> Image.Image:
+    """Deterministic evaluation colour change: brightness, contrast, saturation.
+
+    ``factor`` is exactly 0.80 or 1.20 (SPEC §12). This is not training jitter.
+    """
+    image = image.convert("RGB")
+    for enhancer_cls in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
+        image = enhancer_cls(image).enhance(float(factor))
+    return image
+
+
 def apply_color_jitter(image: Image.Image, fraction: float, rng: random.Random) -> Image.Image:
-    """Independently jitter brightness, contrast, and saturation by +/-fraction."""
+    """Training-only random jitter of brightness, contrast, and saturation."""
     image = image.convert("RGB")
     for enhancer_cls in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
         factor = rng.uniform(1.0 - fraction, 1.0 + fraction)
@@ -137,7 +157,7 @@ def apply_color_jitter(image: Image.Image, fraction: float, rng: random.Random) 
 # ---------------------------------------------------------------------------
 
 
-def apply_resize_degrade(
+def apply_resize(
     image: Image.Image, mask: Image.Image, scale: float, image_size: int = DEFAULT_IMAGE_SIZE
 ) -> Tuple[Image.Image, Image.Image]:
     """Downscale by ``scale`` then upscale back to ``image_size`` (lossy)."""
@@ -175,12 +195,13 @@ _NON_GEOMETRIC_APPLIERS = {
     "jpeg": lambda image, spec, rng: apply_jpeg_compression(image, spec.severity),
     "gaussian_blur": lambda image, spec, rng: apply_gaussian_blur(image, spec.severity),
     "gaussian_noise": lambda image, spec, rng: apply_gaussian_noise(image, spec.severity, rng),
-    "color_jitter": lambda image, spec, rng: apply_color_jitter(image, spec.severity, rng),
-    "identity": lambda image, spec, rng: image,
+    "color_jitter": lambda image, spec, rng: apply_color_adjustment(image, spec.severity),
+    "color_jitter_train": lambda image, spec, rng: apply_color_jitter(image, spec.severity, rng),
+    "clean": lambda image, spec, rng: image,
 }
 
 _GEOMETRIC_APPLIERS = {
-    "resize_degrade": lambda image, mask, spec, size: apply_resize_degrade(image, mask, spec.severity, size),
+    "resize": lambda image, mask, spec, size: apply_resize(image, mask, spec.severity, size),
     "center_crop": lambda image, mask, spec, size: apply_center_crop(image, mask, spec.severity, size),
 }
 
@@ -196,9 +217,9 @@ def apply_transform(
 
     Returns ``(transformed_image, transformed_mask, metadata)`` where
     ``metadata`` is exactly ``{"transform_name", "severity", "is_geometric"}``.
-    Non-geometric transforms leave the mask byte-for-byte untouched (aside
-    from a final size/binarization safety normalization); geometric
-    transforms apply identical crop/resize geometry to both.
+    Pixel-value transforms run at the incoming resolution, then image and
+    mask are resized together to ``image_size``. Geometric transforms apply
+    identical crop/resize geometry to both, then land at ``image_size``.
     """
     if spec.is_geometric:
         applier = _GEOMETRIC_APPLIERS.get(spec.name)

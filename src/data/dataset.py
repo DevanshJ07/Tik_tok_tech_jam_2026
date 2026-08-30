@@ -33,8 +33,8 @@ from torch.utils.data import Dataset
 
 from . import manifests
 from .transforms import (
+    CLEAN,
     DEFAULT_IMAGE_SIZE,
-    IDENTITY,
     IMAGENET_MEAN,
     IMAGENET_STD,
     MissingMaskError,
@@ -44,7 +44,20 @@ from .transforms import (
     zero_mask,
 )
 
-__all__ = ["TraceLensDataset", "MissingMaskError"]
+TASK_AIGC = "aigc"
+TASK_MANIPULATION = "manipulation"
+TASK_LABELS = {
+    TASK_AIGC: (manifests.LABEL_AUTHENTIC, manifests.LABEL_FULLY_SYNTHETIC),
+    TASK_MANIPULATION: (manifests.LABEL_AUTHENTIC, manifests.LABEL_LOCALLY_TAMPERED),
+}
+
+__all__ = [
+    "TASK_AIGC",
+    "TASK_MANIPULATION",
+    "TASK_LABELS",
+    "TraceLensDataset",
+    "MissingMaskError",
+]
 
 
 def _derive_seed(seed: int, key: str) -> int:
@@ -78,9 +91,12 @@ class TraceLensDataset(Dataset):
         in the manifest are resolved against. Absolute paths are used as-is.
         Deliberately configurable (never hardcoded) since the real SID-Set
         location varies per machine.
+    task:
+        ``"aigc"`` keeps labels 0 and 1 only. ``"manipulation"`` keeps labels
+        0 and 2 only. Label 2 is never recoded to 1.
     transform_pool:
         Candidate transforms to sample from (see ``transforms.official_transforms()``).
-        Defaults to ``[IDENTITY]`` (no augmentation) if omitted.
+        Defaults to ``[CLEAN]`` (no augmentation) if omitted.
     seed:
         Deterministic seed governing transform selection/parameterization.
     image_size:
@@ -94,6 +110,7 @@ class TraceLensDataset(Dataset):
         manifest: Union[str, Path, pd.DataFrame],
         split: str,
         dataset_root: Union[str, Path],
+        task: str,
         transform_pool: Optional[Sequence[TransformSpec]] = None,
         seed: int = manifests.DEFAULT_SEED,
         image_size: int = DEFAULT_IMAGE_SIZE,
@@ -101,6 +118,8 @@ class TraceLensDataset(Dataset):
     ) -> None:
         if split not in manifests.VALID_SPLITS:
             raise ValueError(f"split must be one of {manifests.VALID_SPLITS}, got {split!r}")
+        if task not in TASK_LABELS:
+            raise ValueError(f"task must be one of {tuple(TASK_LABELS)}, got {task!r}")
 
         if isinstance(manifest, (str, Path)):
             df = manifests.load_manifest(manifest)
@@ -112,9 +131,17 @@ class TraceLensDataset(Dataset):
         # protected data into the train split without raising here.
         manifests.assert_no_protected_in_train(df)
 
-        self.df = df[df["split"] == split].reset_index(drop=True)
+        allowed = TASK_LABELS[task]
+        filtered = df[(df["split"] == split) & (df["label"].isin(allowed))].reset_index(drop=True)
+        if task == TASK_AIGC and (filtered["label"] == manifests.LABEL_LOCALLY_TAMPERED).any():
+            raise ValueError("AIGC task must not contain label 2.")
+        if task == TASK_MANIPULATION and (filtered["label"] == manifests.LABEL_FULLY_SYNTHETIC).any():
+            raise ValueError("Manipulation task must not contain label 1.")
+
+        self.task = task
+        self.df = filtered
         self.dataset_root = Path(dataset_root)
-        self.transform_pool = list(transform_pool) if transform_pool else [IDENTITY]
+        self.transform_pool = list(transform_pool) if transform_pool else [CLEAN]
         self.seed = seed
         self.image_size = image_size
         self.normalize = normalize
@@ -126,13 +153,13 @@ class TraceLensDataset(Dataset):
         p = Path(raw_path)
         return p if p.is_absolute() else self.dataset_root / p
 
-    def _load_mask(self, row: pd.Series) -> Image.Image:
+    def _load_mask(self, row: pd.Series, image_size: tuple[int, int]) -> Image.Image:
         label = int(row["label"])
         if label != manifests.LABEL_LOCALLY_TAMPERED:
             # Labels 0 (authentic) and 1 (fully synthetic) never have a real
             # tampering mask -- always an all-zero mask, regardless of
             # whatever mask_path might be present in the manifest.
-            return zero_mask((self.image_size, self.image_size))
+            return zero_mask(image_size)
 
         mask_path = row["mask_path"]
         if pd.isna(mask_path):
@@ -157,10 +184,13 @@ class TraceLensDataset(Dataset):
                 f"image_id={row['image_id']!r} image_path does not exist on disk: {image_path}"
             )
 
-        base_image = Image.open(image_path).convert("RGB").resize(
-            (self.image_size, self.image_size), Image.BILINEAR
-        )
-        base_mask = self._load_mask(row).resize((self.image_size, self.image_size), Image.NEAREST)
+        # Native resolution first. JPEG / blur / noise / colour run before the
+        # final 224×224 resize (SPEC §5). Geometric resize/crop include their
+        # own return to image_size.
+        base_image = Image.open(image_path).convert("RGB")
+        base_mask = self._load_mask(row, base_image.size)
+        if base_mask.size != base_image.size:
+            base_mask = base_mask.resize(base_image.size, Image.NEAREST)
         base_mask = binarize_mask(base_mask)
 
         local_seed = _derive_seed(self.seed, str(row["image_id"]))
