@@ -26,6 +26,7 @@ def test_valid_default_configuration_loads() -> None:
     assert config["dataset"]["labels"]["locally_tampered"] == 2
     assert config["paths"]["checkpoints_dir"]
     assert config["paths"]["outputs_dir"]
+    assert config["inference"]["device"] == "cpu"
 
 
 def test_invalid_fusion_weights_are_rejected(tmp_path: Path) -> None:
