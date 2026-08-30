@@ -1,4 +1,5 @@
-"""Tests for the manipulation branch (Member 4): Stage 1 model + Stage 2 training.
+"""Tests for the manipulation branch (Member 4): Stage 1 model + Stage 2 training
++ Stage 3 heatmap visualization.
 
 Uses only mock patch features (``torch.randn``) -- this module has no
 dependence on real DINOv2 features or a real backbone.
@@ -6,14 +7,20 @@ dependence on real DINOv2 features or a real backbone.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from src.data import manifests
 from src.models.manipulation import (
     ManipulationHead,
     patch_logits_to_heatmap,
     topk_manipulation_probability,
+)
+from src.models.manipulation_visualization import (
+    create_manipulation_overlay,
+    heatmap_to_probabilities,
 )
 from src.training.train_manipulation import (
     bce_mask_loss,
@@ -491,3 +498,223 @@ def test_train_one_epoch_raises_when_nothing_eligible() -> None:
     ]
     with pytest.raises(ValueError):
         train_one_epoch(head, batches, optimizer)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: heatmap -> probability conversion
+# ---------------------------------------------------------------------------
+
+
+def test_heatmap_to_probabilities_matches_sigmoid() -> None:
+    torch.manual_seed(20)
+    logits = torch.randn(16, 16) * 5.0
+    probabilities = heatmap_to_probabilities(logits, is_logits=True)
+    assert torch.allclose(probabilities, torch.sigmoid(logits))
+
+
+def test_heatmap_to_probabilities_accepts_channel_dim() -> None:
+    torch.manual_seed(21)
+    logits = torch.randn(1, 16, 16)
+    probabilities = heatmap_to_probabilities(logits)
+    assert probabilities.shape == (16, 16)
+    assert torch.allclose(probabilities, torch.sigmoid(logits.squeeze(0)))
+
+
+def test_heatmap_to_probabilities_no_double_sigmoid() -> None:
+    """is_logits=False must pass an already-[0,1] map through unchanged."""
+    already_probabilities = torch.rand(16, 16)
+    result = heatmap_to_probabilities(already_probabilities, is_logits=False)
+    assert torch.allclose(result, already_probabilities)
+
+
+def test_heatmap_to_probabilities_rejects_mislabelled_probabilities() -> None:
+    """Values outside [0,1] under is_logits=False indicate mislabelled semantics."""
+    logits = torch.tensor([[-3.0, 5.0], [0.2, -0.1]])
+    with pytest.raises(ValueError):
+        heatmap_to_probabilities(logits, is_logits=False)
+
+
+def test_heatmap_to_probabilities_rejects_nan_and_inf() -> None:
+    bad = torch.zeros(16, 16)
+    bad[0, 0] = float("nan")
+    with pytest.raises(ValueError):
+        heatmap_to_probabilities(bad)
+
+    bad_inf = torch.zeros(16, 16)
+    bad_inf[0, 0] = float("inf")
+    with pytest.raises(ValueError):
+        heatmap_to_probabilities(bad_inf)
+
+
+def test_heatmap_to_probabilities_rejects_batched_input() -> None:
+    with pytest.raises(ValueError):
+        heatmap_to_probabilities(torch.randn(4, 1, 16, 16))
+
+
+def test_heatmap_to_probabilities_rejects_empty() -> None:
+    with pytest.raises(ValueError):
+        heatmap_to_probabilities(torch.zeros(0, 0))
+
+
+def test_heatmap_to_probabilities_rejects_unsupported_type() -> None:
+    with pytest.raises(TypeError):
+        heatmap_to_probabilities([[0.1, 0.2], [0.3, 0.4]])
+
+
+def test_heatmap_to_probabilities_detaches_from_autograd() -> None:
+    logits = torch.randn(16, 16, requires_grad=True)
+    probabilities = heatmap_to_probabilities(logits)
+    assert not probabilities.requires_grad
+
+
+def test_heatmap_to_probabilities_accepts_numpy() -> None:
+    logits_np = np.random.randn(16, 16).astype(np.float32)
+    result = heatmap_to_probabilities(logits_np)
+    expected = torch.sigmoid(torch.from_numpy(logits_np))
+    assert torch.allclose(result, expected)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: overlay rendering
+# ---------------------------------------------------------------------------
+
+
+def make_test_image(size: tuple[int, int] = (64, 48), color: tuple[int, int, int] = (120, 130, 140)) -> Image.Image:
+    return Image.new("RGB", size, color)
+
+
+def test_overlay_returns_pil_image() -> None:
+    image = make_test_image()
+    heatmap = torch.zeros(16, 16)
+    overlay = create_manipulation_overlay(image, heatmap)
+    assert isinstance(overlay, Image.Image)
+
+
+def test_overlay_matches_original_dimensions() -> None:
+    image = make_test_image(size=(100, 40))
+    heatmap = torch.zeros(16, 16)
+    overlay = create_manipulation_overlay(image, heatmap)
+    assert overlay.size == image.size
+
+
+def test_overlay_does_not_mutate_original_image() -> None:
+    image = make_test_image()
+    original_bytes = image.tobytes()
+    heatmap = torch.randn(16, 16)
+    create_manipulation_overlay(image, heatmap)
+    assert image.tobytes() == original_bytes
+
+
+def test_overlay_accepts_hw_heatmap() -> None:
+    image = make_test_image()
+    heatmap = torch.zeros(16, 16)
+    overlay = create_manipulation_overlay(image, heatmap)
+    assert overlay.size == image.size
+
+
+def test_overlay_accepts_1hw_heatmap() -> None:
+    image = make_test_image()
+    heatmap_hw = torch.randn(16, 16)
+    heatmap_1hw = heatmap_hw.unsqueeze(0)
+    overlay_hw = create_manipulation_overlay(image, heatmap_hw)
+    overlay_1hw = create_manipulation_overlay(image, heatmap_1hw)
+    assert np.array_equal(np.array(overlay_hw), np.array(overlay_1hw))
+
+
+def test_overlay_accepts_torch_heatmap() -> None:
+    image = make_test_image()
+    heatmap = torch.randn(16, 16)
+    overlay = create_manipulation_overlay(image, heatmap)
+    assert isinstance(overlay, Image.Image)
+
+
+def test_overlay_accepts_numpy_heatmap() -> None:
+    image = make_test_image()
+    torch.manual_seed(22)
+    heatmap_t = torch.randn(16, 16)
+    overlay_t = create_manipulation_overlay(image, heatmap_t)
+    overlay_np = create_manipulation_overlay(image, heatmap_t.numpy())
+    assert np.array_equal(np.array(overlay_t), np.array(overlay_np))
+
+
+def test_overlay_resizes_heatmap_to_original_image() -> None:
+    """A small heatmap must be upsampled to the full image size, not left mismatched."""
+    image = make_test_image(size=(64, 64), color=(0, 0, 0))
+    heatmap = torch.full((4, 4), -10.0)  # near-zero probability everywhere
+    heatmap[0, 0] = 10.0  # one strongly positive corner
+
+    overlay = create_manipulation_overlay(image, heatmap, alpha=1.0)
+    pixels = np.array(overlay)
+    assert pixels.shape[:2] == (64, 64)
+
+    # The corner corresponding to the hot patch should differ far more from
+    # black than the opposite (near-zero-probability) corner.
+    hot_corner = pixels[0:4, 0:4].astype(np.float32)
+    cold_corner = pixels[-4:, -4:].astype(np.float32)
+    assert hot_corner.mean() > cold_corner.mean() + 20
+
+
+def test_overlay_alpha_zero_is_unchanged_original() -> None:
+    image = make_test_image()
+    heatmap = torch.randn(16, 16) * 10.0
+    overlay = create_manipulation_overlay(image, heatmap, alpha=0.0)
+    assert np.array_equal(np.array(overlay), np.array(image.convert("RGB")))
+
+
+@pytest.mark.parametrize("bad_alpha", [-0.1, 1.1, float("nan")])
+def test_overlay_rejects_invalid_alpha(bad_alpha: float) -> None:
+    image = make_test_image()
+    heatmap = torch.zeros(16, 16)
+    with pytest.raises(ValueError):
+        create_manipulation_overlay(image, heatmap, alpha=bad_alpha)
+
+
+def test_overlay_rejects_invalid_heatmap_rank() -> None:
+    image = make_test_image()
+    with pytest.raises(ValueError):
+        create_manipulation_overlay(image, torch.randn(2, 1, 16, 16))
+    with pytest.raises(ValueError):
+        create_manipulation_overlay(image, torch.randn(16))
+
+
+def test_overlay_rejects_nan_inf_heatmap() -> None:
+    image = make_test_image()
+    heatmap = torch.zeros(16, 16)
+    heatmap[3, 3] = float("nan")
+    with pytest.raises(ValueError):
+        create_manipulation_overlay(image, heatmap)
+
+
+def test_overlay_rejects_non_pil_image() -> None:
+    heatmap = torch.zeros(16, 16)
+    with pytest.raises(TypeError):
+        create_manipulation_overlay(np.zeros((10, 10, 3), dtype=np.uint8), heatmap)
+
+
+def test_overlay_low_probability_changes_less_than_high_probability() -> None:
+    image = make_test_image(color=(0, 0, 0))
+    low_logits = torch.full((16, 16), -8.0)   # sigmoid ~ 0.0003
+    high_logits = torch.full((16, 16), 8.0)   # sigmoid ~ 0.9997
+
+    low_overlay = np.array(create_manipulation_overlay(image, low_logits)).astype(np.float32)
+    high_overlay = np.array(create_manipulation_overlay(image, high_logits)).astype(np.float32)
+    original = np.array(image.convert("RGB")).astype(np.float32)
+
+    low_change = np.abs(low_overlay - original).mean()
+    high_change = np.abs(high_overlay - original).mean()
+    assert low_change < high_change
+
+
+def test_overlay_uniform_low_confidence_is_not_stretched_to_look_suspicious() -> None:
+    """A uniformly low-probability heatmap must stay unobtrusive, not be
+    min-max-normalized into a falsely alarming full-strength overlay."""
+    image = make_test_image(color=(10, 10, 10))
+    uniform_low_logits = torch.full((16, 16), -6.0)  # sigmoid ~ 0.0025 everywhere
+
+    overlay = np.array(create_manipulation_overlay(image, uniform_low_logits)).astype(np.float32)
+    original = np.array(image.convert("RGB")).astype(np.float32)
+
+    mean_change = np.abs(overlay - original).mean()
+    # If this were min-max normalized per-image, a uniform map would be
+    # stretched to look maximally suspicious; it must instead stay small.
+    assert mean_change < 5.0
