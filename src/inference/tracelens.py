@@ -192,6 +192,9 @@ class TraceLensPredictor:
         probability = float(outputs["aigc_probability"][0].detach().cpu())
 
         reliability_score = self._optional_reliability(outputs, patch_features)
+        binder = getattr(self.manipulation_module, "bind_source_image", None)
+        if callable(binder):
+            binder(path)
         manipulation_probability, heatmap_path = self._optional_manipulation(
             outputs, patch_features
         )

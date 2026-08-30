@@ -22,8 +22,10 @@ module never runs a backbone itself.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -35,21 +37,38 @@ from src.models.manipulation import DEFAULT_PATCH_GRID_SIZE, ManipulationHead
 
 __all__ = [
     "MANIPULATION_TRAINING_LABELS",
+    "CHECKPOINT_FORMAT_VERSION",
+    "ManipulationMaskError",
+    "ManipulationCheckpointError",
     "ManipulationLoss",
     "EpochStats",
     "resize_mask_to_patch_grid",
+    "validate_manipulation_masks",
     "bce_mask_loss",
     "dice_loss",
     "manipulation_loss",
     "filter_manipulation_batch",
+    "resolve_manipulation_device",
+    "save_manipulation_checkpoint",
+    "load_manipulation_checkpoint",
     "train_one_epoch",
 ]
 
 DEFAULT_DICE_EPSILON = 1e-6
+CHECKPOINT_FORMAT_VERSION = 1
+CPU_DEVICE = "cpu"
 
 # Labels 0 (authentic) and 2 (locally tampered) contribute to manipulation
 # training; label 1 (fully synthetic) never does (see module docstring).
 MANIPULATION_TRAINING_LABELS = (manifests.LABEL_AUTHENTIC, manifests.LABEL_LOCALLY_TAMPERED)
+
+
+class ManipulationMaskError(ValueError):
+    """Raised when a manipulation mask is missing or contract-invalid."""
+
+
+class ManipulationCheckpointError(ValueError):
+    """Raised when a manipulation checkpoint is missing or incompatible."""
 
 
 @dataclass
@@ -103,6 +122,196 @@ def resize_mask_to_patch_grid(
     batch_size = mask.shape[0]
     patch_targets = F.adaptive_max_pool2d(mask.float(), output_size=(patch_grid_size, patch_grid_size))
     return patch_targets.reshape(batch_size, patch_grid_size * patch_grid_size)
+
+
+def validate_manipulation_masks(mask: Tensor | None, label: Tensor) -> Tensor:
+    """Enforce label-specific mask policy and return a normalized mask tensor.
+
+    * Label ``2`` requires a present, non-empty real mask. Missing or all-zero
+      masks raise :class:`ManipulationMaskError`.
+    * Label ``0`` is normalized to an all-zero mask (any residual positives
+      are cleared so authentic samples cannot leak tamper supervision).
+    * Label ``1`` is rejected here; it must already have been excluded.
+    """
+    if mask is None:
+        raise ManipulationMaskError(
+            "Manipulation mask is missing. Label-2 samples require a real "
+            "non-empty mask; label-0 samples require an all-zero mask."
+        )
+    if not torch.is_tensor(mask):
+        raise ManipulationMaskError(
+            f"Manipulation mask must be a tensor, got {type(mask).__name__}."
+        )
+    if mask.numel() == 0:
+        raise ManipulationMaskError("Manipulation mask is empty.")
+
+    label_tensor = label if torch.is_tensor(label) else torch.as_tensor(label)
+    if mask.shape[0] != label_tensor.shape[0]:
+        raise ManipulationMaskError(
+            f"mask batch {mask.shape[0]} does not match label batch {label_tensor.shape[0]}."
+        )
+
+    unique = set(int(v) for v in torch.unique(label_tensor).tolist())
+    if manifests.LABEL_FULLY_SYNTHETIC in unique:
+        raise ManipulationMaskError(
+            "Label 1 (fully synthetic) is excluded from manipulation training "
+            "and must not be validated as a manipulation sample."
+        )
+    unexpected = unique - set(MANIPULATION_TRAINING_LABELS)
+    if unexpected:
+        raise ManipulationMaskError(
+            f"label contains values outside {MANIPULATION_TRAINING_LABELS}: {sorted(unexpected)}"
+        )
+
+    normalized = mask.detach().clone().float()
+    flat = normalized.reshape(normalized.shape[0], -1)
+    row_sums = flat.sum(dim=1)
+
+    label2 = label_tensor == manifests.LABEL_LOCALLY_TAMPERED
+    if bool(label2.any()) and bool(torch.any(row_sums[label2] <= 0)):
+        raise ManipulationMaskError(
+            "Label 2 (locally tampered) requires a non-empty real manipulation "
+            "mask. All-zero or missing masks are rejected."
+        )
+
+    label0 = label_tensor == manifests.LABEL_AUTHENTIC
+    if bool(label0.any()):
+        normalized[label0] = 0
+    return normalized
+
+
+def resolve_manipulation_device(device: str | None) -> torch.device:
+    """Return a torch device. CPU is the default. CUDA is never implied."""
+    requested = CPU_DEVICE if device is None or str(device).strip() == "" else str(device).strip()
+    if requested == CPU_DEVICE:
+        return torch.device(CPU_DEVICE)
+    if requested == "cuda" or requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Device {requested!r} was requested but CUDA is not available. "
+                "Use device='cpu' (the safe default)."
+            )
+        return torch.device(requested)
+    raise RuntimeError(f"Unsupported device {requested!r}. Use 'cpu' or 'cuda'.")
+
+
+def _move_batch_tensors(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    moved: dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def save_manipulation_checkpoint(
+    path: str | Path,
+    *,
+    model: ManipulationHead,
+    epoch: int = 0,
+    optimizer: Optional[Optimizer] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """Atomically write a versioned ManipulationHead checkpoint."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "kind": "manipulation_head",
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "epoch": int(epoch),
+        "model_hparams": {
+            "embedding_dim": model.embedding_dim,
+            "hidden_dim": model.hidden_dim,
+            "patch_grid_size": model.patch_grid_size,
+            "heatmap_size": model.heatmap_size,
+            "top_k": model.top_k,
+        },
+        "train_metadata": {
+            "training_labels": list(MANIPULATION_TRAINING_LABELS),
+            "patch_grid_size": model.patch_grid_size,
+        },
+        "extra": dict(extra) if extra else {},
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+    return path
+
+
+def load_manipulation_checkpoint(
+    path: str | Path,
+    *,
+    map_location: str | torch.device = CPU_DEVICE,
+    model: Optional[ManipulationHead] = None,
+) -> dict[str, Any]:
+    """Load a checkpoint written by :func:`save_manipulation_checkpoint`."""
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise ManipulationCheckpointError(
+            f"Manipulation checkpoint not found: {checkpoint_path}"
+        )
+    try:
+        payload = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    except Exception as exc:
+        raise ManipulationCheckpointError(
+            f"Invalid or unreadable manipulation checkpoint {checkpoint_path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or "model_state_dict" not in payload:
+        raise ManipulationCheckpointError(
+            f"{checkpoint_path} is not a TraceLens-R manipulation checkpoint "
+            "(missing 'model_state_dict')."
+        )
+    version = payload.get("format_version")
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise ManipulationCheckpointError(
+            f"Incompatible manipulation checkpoint format_version {version!r}; "
+            f"expected {CHECKPOINT_FORMAT_VERSION}."
+        )
+    kind = payload.get("kind")
+    if kind not in (None, "manipulation_head"):
+        raise ManipulationCheckpointError(
+            f"Incompatible checkpoint kind {kind!r}; expected 'manipulation_head'."
+        )
+    hparams = payload.get("model_hparams") or {}
+    expected = {
+        "embedding_dim": 384,
+        "patch_grid_size": DEFAULT_PATCH_GRID_SIZE,
+    }
+    embed_dim = int(hparams.get("embedding_dim", expected["embedding_dim"]))
+    grid = int(hparams.get("patch_grid_size", expected["patch_grid_size"]))
+    if embed_dim != expected["embedding_dim"] or grid != expected["patch_grid_size"]:
+        raise ManipulationCheckpointError(
+            f"Incompatible manipulation checkpoint {checkpoint_path}: "
+            f"embedding_dim={embed_dim}, patch_grid_size={grid}; "
+            f"expected {expected['embedding_dim']} and {expected['patch_grid_size']}."
+        )
+    created = False
+    if model is None:
+        model = ManipulationHead(
+            embedding_dim=embed_dim,
+            hidden_dim=int(hparams.get("hidden_dim", 128)),
+            patch_grid_size=grid,
+            heatmap_size=int(hparams.get("heatmap_size", 224)),
+            top_k=int(hparams.get("top_k", 16)),
+        )
+        created = True
+    try:
+        model.load_state_dict(payload["model_state_dict"], strict=True)
+    except RuntimeError as exc:
+        raise ManipulationCheckpointError(
+            f"Incompatible manipulation checkpoint state dict: {exc}"
+        ) from exc
+    return {
+        "model": model,
+        "created_model": created,
+        "epoch": int(payload.get("epoch", 0)),
+        "model_hparams": hparams,
+        "train_metadata": payload.get("train_metadata", {}),
+        "extra": payload.get("extra", {}),
+    }
 
 
 def bce_mask_loss(patch_mask_logits: Tensor, target: Tensor) -> Tensor:
@@ -198,7 +407,10 @@ def filter_manipulation_batch(
     eligible = label_tensor != manifests.LABEL_FULLY_SYNTHETIC
     if not torch.any(eligible):
         return None
-    return patch_features[eligible], mask[eligible], label_tensor[eligible]
+    features = patch_features[eligible]
+    labels = label_tensor[eligible]
+    masks = validate_manipulation_masks(mask[eligible], labels)
+    return features, masks, labels
 
 
 def train_one_epoch(
@@ -210,6 +422,7 @@ def train_one_epoch(
     bce_weight: float = 1.0,
     dice_weight: float = 1.0,
     dice_epsilon: float = DEFAULT_DICE_EPSILON,
+    device: str | None = CPU_DEVICE,
 ) -> EpochStats:
     """Run one training epoch over pre-extracted patch-feature batches.
 
@@ -218,11 +431,12 @@ def train_one_epoch(
     ``[B]`` (SID-Set 0/1/2 convention). Label-1 rows are dropped per batch
     via :func:`filter_manipulation_batch`; a batch left with no eligible
     rows is skipped rather than back-propagated through a meaningless loss.
-    Suitable for CPU execution with a standard PyTorch optimizer -- this is
-    intentionally not a general-purpose trainer.
+    ``device`` defaults to CPU. CUDA is used only when requested and available.
 
     Raises ``ValueError`` if every batch was skipped (nothing to train on).
     """
+    torch_device = resolve_manipulation_device(device)
+    model.to(torch_device)
     model.train()
     total_loss = 0.0
     total_bce = 0.0
@@ -231,7 +445,10 @@ def train_one_epoch(
     num_skipped = 0
 
     for batch in batches:
-        filtered = filter_manipulation_batch(batch["patch_features"], batch["mask"], batch["label"])
+        moved = _move_batch_tensors(batch, torch_device)
+        filtered = filter_manipulation_batch(
+            moved["patch_features"], moved["mask"], moved["label"]
+        )
         if filtered is None:
             num_skipped += 1
             continue

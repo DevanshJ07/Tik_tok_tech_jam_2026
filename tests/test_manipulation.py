@@ -378,6 +378,8 @@ def test_filter_batch_excludes_label_1() -> None:
 def test_filter_batch_mixed_labels_excludes_only_label_1() -> None:
     patch_features = make_patch_features(6)
     mask = torch.zeros(6, 1, 224, 224)
+    mask[2, 0, 10:20, 10:20] = 1.0
+    mask[5, 0, 30:40, 30:40] = 1.0
     label = torch.tensor([0, 1, 2, 1, 0, 2])
 
     filtered_features, filtered_mask, filtered_label = filter_manipulation_batch(
@@ -442,10 +444,13 @@ def test_train_one_epoch_completes_forward_backward_with_mock_features() -> None
     head = ManipulationHead()
     optimizer = torch.optim.SGD(head.parameters(), lr=0.01)
 
+    tampered = torch.zeros(4, 1, 224, 224)
+    tampered[1, 0, 8:40, 8:40] = 1.0
+    tampered[3, 0, 80:120, 80:120] = 1.0
     batches = [
         {
             "patch_features": make_patch_features(4),
-            "mask": (torch.rand(4, 1, 224, 224) > 0.5).float(),
+            "mask": tampered,
             "label": torch.tensor([0, 2, 0, 2]),
         },
         {
@@ -455,7 +460,7 @@ def test_train_one_epoch_completes_forward_backward_with_mock_features() -> None
         },
     ]
 
-    stats = train_one_epoch(head, batches, optimizer)
+    stats = train_one_epoch(head, batches, optimizer, device="cpu")
 
     assert stats.num_batches == 2
     assert stats.num_skipped_batches == 0
@@ -467,6 +472,9 @@ def test_train_one_epoch_skips_all_label_1_batches() -> None:
     torch.manual_seed(12)
     head = ManipulationHead()
     optimizer = torch.optim.SGD(head.parameters(), lr=0.01)
+    tampered = torch.zeros(4, 1, 224, 224)
+    tampered[1, 0, 8:40, 8:40] = 1.0
+    tampered[3, 0, 80:120, 80:120] = 1.0
 
     batches = [
         {
@@ -476,7 +484,7 @@ def test_train_one_epoch_skips_all_label_1_batches() -> None:
         },
         {
             "patch_features": make_patch_features(4),
-            "mask": (torch.rand(4, 1, 224, 224) > 0.5).float(),
+            "mask": tampered,
             "label": torch.tensor([0, 2, 0, 2]),
         },
     ]
