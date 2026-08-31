@@ -1,43 +1,20 @@
-"""
-TraceLens-R Reliability Training
-================================
-
-Member 3 component.
-
-This trainer uses Member 2's trained baseline as a FROZEN teacher.
-
-The reliability head is the only trainable component.
-
-Expected baseline:
-    BaselineAIGCDetector
-
-Expected baseline attributes:
-    baseline.global_head
-    baseline.patch_head
-
-Expected features:
-    clean_patch_features    [B, 256, 384]
-    degraded_patch_features [B, 256, 384]
-    degraded_cls_features   [B, 384]
-
-Expected labels:
-    0 = authentic
-    1 = fully synthetic
-
-Label 2 is excluded from AIGC reliability training.
-"""
+"""Member 3 reliability training for TraceLens-R."""
 
 from __future__ import annotations
 
+import argparse
+import csv
+import json
 import random
 from pathlib import Path
-from typing import Dict, Iterable, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
+from scripts.cache_features import load_cached_feature
+from src.models.baseline import BaselineAIGCDetector
 from src.models.reliability import (
     TraceLensReliability,
     compute_survival_target,
@@ -45,566 +22,391 @@ from src.models.reliability import (
 )
 
 
-# ---------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------
-
-def set_seed(seed: int = 42) -> None:
-    """Set random seeds for reproducible lightweight training."""
-
+def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
+class PairedFeatureDataset(Dataset):
+    """Clean/transformed AIGC pairs linked by image_id."""
 
-# ---------------------------------------------------------------------
-# Freeze Member 2 teacher
-# ---------------------------------------------------------------------
+    def __init__(self, cache_root: str, split: str):
+        root = Path(cache_root)
+        clean_dir = root / "clean" / split
+        transformed_dir = root / "transformed" / split
 
-def freeze_baseline(baseline: nn.Module) -> None:
-    """
-    Freeze Member 2's baseline teacher.
+        if not clean_dir.exists():
+            raise FileNotFoundError(clean_dir)
+        if not transformed_dir.exists():
+            raise FileNotFoundError(transformed_dir)
 
-    The baseline is used only to generate teacher evidence.
-    No baseline parameter should receive gradients.
-    """
+        pairs = []
 
-    baseline.eval()
+        for path in sorted(transformed_dir.glob("*.pt")):
+            clean_path = clean_dir / path.name
+            if not clean_path.exists():
+                continue
 
-    for parameter in baseline.parameters():
-        parameter.requires_grad_(False)
+            clean = load_cached_feature(clean_path)
+            transformed = load_cached_feature(path)
 
+            label = int(clean["label"])
+            if label not in (0, 1):
+                continue
 
-# ---------------------------------------------------------------------
-# Member 2 baseline helpers
-# ---------------------------------------------------------------------
+            if int(transformed["label"]) != label:
+                raise ValueError(f"Label mismatch for {path.name}")
 
-@torch.no_grad()
-def get_patch_logits(
-    baseline: nn.Module,
-    patch_features: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Run Member 2's patch evidence head.
+            pairs.append((clean_path, path))
 
-    Member 2's actual attribute is:
-        baseline.patch_head
+        if not pairs:
+            raise RuntimeError(f"No paired features found in {split}")
 
-    Input:
-        [B, 256, 384]
+        self.pairs = pairs
 
-    Output:
-        [B, 256]
-    """
+    def __len__(self):
+        return len(self.pairs)
 
-    logits = baseline.patch_head(patch_features)
+    def __getitem__(self, idx):
+        clean_path, transformed_path = self.pairs[idx]
+        clean = load_cached_feature(clean_path)
+        transformed = load_cached_feature(transformed_path)
 
-    if logits.ndim == 3 and logits.shape[-1] == 1:
-        logits = logits.squeeze(-1)
+        return {
+            "image_id": clean["image_id"],
+            "label": int(clean["label"]),
+            "clean_cls": torch.as_tensor(clean["cls_features"]).float(),
+            "clean_patch": torch.as_tensor(clean["patch_features"]).float(),
+            "degraded_cls": torch.as_tensor(transformed["cls_features"]).float(),
+            "degraded_patch": torch.as_tensor(transformed["patch_features"]).float(),
+        }
 
-    if logits.ndim != 2:
-        raise AssertionError(
-            "Member 2 patch_head must return [B, 256]. "
-            f"Got {tuple(logits.shape)}"
-        )
 
-    if logits.shape[1] != 256:
-        raise AssertionError(
-            f"Expected 256 patch logits, got {logits.shape[1]}"
-        )
-
-    return logits
-
-
-@torch.no_grad()
-def get_global_logit(
-    baseline: nn.Module,
-    cls_features: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Run Member 2's global classification head.
-
-    Member 2's actual attribute is:
-        baseline.global_head
-
-    Input:
-        [B, 384]
-
-    Output:
-        [B]
-    """
-
-    logit = baseline.global_head(cls_features)
-
-    if logit.ndim == 2 and logit.shape[-1] == 1:
-        logit = logit.squeeze(-1)
-
-    logit = logit.reshape(-1)
-
-    return logit
-
-
-# ---------------------------------------------------------------------
-# Classification loss
-# ---------------------------------------------------------------------
-
-def classification_loss(
-    final_logit: torch.Tensor,
-    labels: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Binary AIGC classification loss.
-
-    Only labels 0 and 1 are valid.
-
-    Label 2 is NOT automatically AI-generated.
-    """
-
-    labels = labels.reshape(-1).long()
-
-    if not torch.all((labels == 0) | (labels == 1)):
-        raise ValueError(
-            "AIGC reliability training only accepts labels 0 and 1. "
-            "Label 2 must not enter the AIGC classification loss."
-        )
-
-    return F.binary_cross_entropy_with_logits(
-        final_logit,
-        labels.float(),
-    )
-
-
-# ---------------------------------------------------------------------
-# One training step
-# ---------------------------------------------------------------------
-
-def reliability_training_step(
-    reliability_model: TraceLensReliability,
-    baseline_teacher: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-    classification_weight: float = 1.0,
-    survival_weight: float = 1.0,
-) -> Dict[str, torch.Tensor]:
-    """
-    Perform one training step.
-
-    The baseline teacher remains frozen.
-
-    Required batch keys:
-
-        clean_patch_features
-        degraded_patch_features
-        degraded_cls_features
-        label
-    """
-
-    labels = batch["label"].to(device).long().reshape(-1)
-
-    clean_patch_features = batch[
-        "clean_patch_features"
-    ].to(device)
-
-    degraded_patch_features = batch[
-        "degraded_patch_features"
-    ].to(device)
-
-    degraded_cls_features = batch[
-        "degraded_cls_features"
-    ].to(device)
-
-    # ---------------------------------------------------------------
-    # Keep only official AIGC labels.
-    #
-    # Label 0 = authentic
-    # Label 1 = fully synthetic
-    #
-    # Label 2 = locally tampered and must not become AIGC-positive.
-    # ---------------------------------------------------------------
-
-    valid = (labels == 0) | (labels == 1)
-
-    if not torch.all(valid):
-
-        labels = labels[valid]
-
-        clean_patch_features = (
-            clean_patch_features[valid]
-        )
-
-        degraded_patch_features = (
-            degraded_patch_features[valid]
-        )
-
-        degraded_cls_features = (
-            degraded_cls_features[valid]
-        )
-
-    if labels.numel() == 0:
-        raise ValueError(
-            "Batch contains no label-0 or label-1 samples."
-        )
-
-    # ---------------------------------------------------------------
-    # Frozen baseline teacher
-    # ---------------------------------------------------------------
-
-    with torch.no_grad():
-
-        clean_patch_logits = get_patch_logits(
-            baseline_teacher,
-            clean_patch_features,
-        )
-
-        degraded_patch_logits = get_patch_logits(
-            baseline_teacher,
-            degraded_patch_features,
-        )
-
-        degraded_global_logit = get_global_logit(
-            baseline_teacher,
-            degraded_cls_features,
-        )
-
-        # -----------------------------------------------------------
-        # Generate detached survival targets.
-        # -----------------------------------------------------------
-
-        survival_target, target_weight = (
-            compute_survival_target(
-                clean_patch_logits=clean_patch_logits,
-                degraded_patch_logits=degraded_patch_logits,
-                labels=labels,
-            )
-        )
-
-    # ---------------------------------------------------------------
-    # Reliability model
-    #
-    # The reliability model receives degraded patch features and
-    # frozen baseline patch/global evidence.
-    # ---------------------------------------------------------------
-
-    outputs = reliability_model(
-        patch_features=degraded_patch_features,
-        patch_logits=degraded_patch_logits,
-        global_logit=degraded_global_logit,
-    )
-
-    # ---------------------------------------------------------------
-    # AIGC classification loss
-    # ---------------------------------------------------------------
-
-    cls_loss = classification_loss(
-        outputs["final_logit"],
-        labels,
-    )
-
-    # ---------------------------------------------------------------
-    # Survival loss
-    # ---------------------------------------------------------------
-
-    surv_loss = survival_loss(
-        predicted_reliability=outputs["reliability"],
-        survival_target=survival_target,
-        target_weight=target_weight,
-    )
-
-    # ---------------------------------------------------------------
-    # Combined objective
-    # ---------------------------------------------------------------
-
-    total_loss = (
-        classification_weight * cls_loss
-        + survival_weight * surv_loss
-    )
-
+def collate(batch):
     return {
-        "loss": total_loss,
-        "classification_loss": cls_loss.detach(),
-        "survival_loss": surv_loss.detach(),
-        "aigc_probability": outputs[
-            "aigc_probability"
-        ].detach(),
-        "mean_reliability": outputs[
-            "mean_reliability"
-        ].detach(),
+        "image_id": [x["image_id"] for x in batch],
+        "label": torch.tensor([x["label"] for x in batch], dtype=torch.long),
+        "clean_cls": torch.stack([x["clean_cls"] for x in batch]),
+        "clean_patch": torch.stack([x["clean_patch"] for x in batch]),
+        "degraded_cls": torch.stack([x["degraded_cls"] for x in batch]),
+        "degraded_patch": torch.stack([x["degraded_patch"] for x in batch]),
     }
 
 
-# ---------------------------------------------------------------------
-# Epoch training
-# ---------------------------------------------------------------------
-
-def train_one_epoch(
-    reliability_model: TraceLensReliability,
-    baseline_teacher: nn.Module,
-    dataloader: Iterable[Dict[str, torch.Tensor]],
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    classification_weight: float = 1.0,
-    survival_weight: float = 1.0,
-) -> Dict[str, float]:
-    """
-    Train the reliability head for one epoch.
-    """
-
-    reliability_model.train()
-    baseline_teacher.eval()
-
-    total_loss = 0.0
-    total_cls_loss = 0.0
-    total_survival_loss = 0.0
-
-    num_batches = 0
-
-    for batch in dataloader:
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        result = reliability_training_step(
-            reliability_model=reliability_model,
-            baseline_teacher=baseline_teacher,
-            batch=batch,
-            device=device,
-            classification_weight=classification_weight,
-            survival_weight=survival_weight,
-        )
-
-        result["loss"].backward()
-
-        optimizer.step()
-
-        total_loss += result[
-            "loss"
-        ].item()
-
-        total_cls_loss += result[
-            "classification_loss"
-        ].item()
-
-        total_survival_loss += result[
-            "survival_loss"
-        ].item()
-
-        num_batches += 1
-
-    if num_batches == 0:
-        raise RuntimeError(
-            "Dataloader produced zero batches."
-        )
-
-    return {
-        "loss": total_loss / num_batches,
-        "classification_loss": (
-            total_cls_loss / num_batches
-        ),
-        "survival_loss": (
-            total_survival_loss / num_batches
-        ),
-    }
-
-
-# ---------------------------------------------------------------------
-# Checkpoint utilities
-# ---------------------------------------------------------------------
-
-def save_checkpoint(
-    path: str | Path,
-    reliability_model: TraceLensReliability,
-    optimizer: Optional[
-        torch.optim.Optimizer
-    ] = None,
-    epoch: int = 0,
-    metrics: Optional[
-        Dict[str, float]
-    ] = None,
-) -> None:
-    """Save Member 3 reliability checkpoint."""
-
-    path = Path(path)
-
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    checkpoint = {
-        "component": "tracelens_reliability",
-        "member": 3,
-        "epoch": epoch,
-        "model_state_dict": (
-            reliability_model.state_dict()
-        ),
-        "metrics": metrics or {},
-    }
-
-    if optimizer is not None:
-        checkpoint[
-            "optimizer_state_dict"
-        ] = optimizer.state_dict()
-
-    torch.save(
-        checkpoint,
-        path,
-    )
-
-
-def load_checkpoint(
-    path: str | Path,
-    reliability_model: TraceLensReliability,
-    optimizer: Optional[
-        torch.optim.Optimizer
-    ] = None,
-    map_location: str | torch.device = "cpu",
-) -> Dict:
-    """Load Member 3 reliability checkpoint."""
-
+def load_baseline(path: str, device: torch.device):
+    """Load frozen Member 2 baseline heads."""
     checkpoint = torch.load(
         path,
-        map_location=map_location,
+        map_location=device,
+        weights_only=False,
     )
 
-    reliability_model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
+    if "model_state_dict" not in checkpoint:
+        raise KeyError("Baseline checkpoint must contain 'model_state_dict'")
 
-    if (
-        optimizer is not None
-        and "optimizer_state_dict" in checkpoint
-    ):
-        optimizer.load_state_dict(
-            checkpoint["optimizer_state_dict"]
+    hparams = checkpoint.get("model_hparams", {})
+
+    model = BaselineAIGCDetector(**hparams)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    model.to(device)
+    model.eval()
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    return model
+
+
+@torch.no_grad()
+def baseline_outputs(model, cls_features, patch_features):
+    return model(cls_features, patch_features)
+
+
+def run_epoch(
+    reliability,
+    baseline,
+    loader,
+    optimizer,
+    device,
+    training: bool,
+):
+    reliability.train(training)
+
+    total_loss = 0.0
+    total_survival = 0.0
+    total_cls = 0.0
+    total_correct = 0
+    total_n = 0
+
+    for batch in loader:
+        label = batch["label"].to(device)
+
+        clean_patch = batch["clean_patch"].to(device)
+        clean_cls = batch["clean_cls"].to(device)
+        degraded_patch = batch["degraded_patch"].to(device)
+        degraded_cls = batch["degraded_cls"].to(device)
+
+        # Baseline is frozen. Its original aigc_probability is never modified.
+        with torch.no_grad():
+            clean_base = baseline_outputs(
+                baseline, clean_cls, clean_patch
+            )
+            degraded_base = baseline_outputs(
+                baseline, degraded_cls, degraded_patch
+            )
+
+            survival_target, target_weight = compute_survival_target(
+                clean_patch_logits=clean_base["patch_logits"],
+                degraded_patch_logits=degraded_base["patch_logits"],
+                labels=label,
+            )
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        output = reliability(
+            patch_features=degraded_patch,
+            patch_logits=degraded_base["patch_logits"].detach(),
+            global_logit=degraded_base["global_logit"].detach(),
         )
 
-    return checkpoint
+        loss_survival = survival_loss(
+            predicted_reliability=output["reliability"],
+            survival_target=survival_target,
+            target_weight=target_weight,
+        )
+
+        # Train the fused AIGC prediction as well.
+        cls_loss = F.binary_cross_entropy_with_logits(
+            output["final_logit"],
+            label.float(),
+        )
+
+        loss = loss_survival + cls_loss
+
+        if training:
+            loss.backward()
+            optimizer.step()
+
+        batch_n = label.numel()
+        predictions = (output["aigc_probability"] >= 0.5).long()
+
+        total_loss += loss.item() * batch_n
+        total_survival += loss_survival.item() * batch_n
+        total_cls += cls_loss.item() * batch_n
+        total_correct += (predictions == label).sum().item()
+        total_n += batch_n
+
+    return {
+        "loss": total_loss / total_n,
+        "survival_loss": total_survival / total_n,
+        "classification_loss": total_cls / total_n,
+        "accuracy": total_correct / total_n,
+    }
 
 
-# ---------------------------------------------------------------------
-# Model creation
-# ---------------------------------------------------------------------
+@torch.no_grad()
+def save_validation_predictions(
+    reliability,
+    baseline,
+    loader,
+    device,
+    path: Path,
+):
+    reliability.eval()
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-def build_reliability_model(
-    device: torch.device,
-    hidden_dim: int = 128,
-    dropout: float = 0.1,
-) -> TraceLensReliability:
-    """Create the trainable Member 3 model."""
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "image_id",
+                "label",
+                "baseline_aigc_probability",
+                "reliability_aigc_probability",
+                "mean_reliability",
+            ],
+        )
+        writer.writeheader()
 
-    model = TraceLensReliability(
-        embed_dim=384,
-        hidden_dim=hidden_dim,
-        dropout=dropout,
-    )
+        for batch in loader:
+            label = batch["label"].to(device)
+            patch = batch["degraded_patch"].to(device)
+            cls = batch["degraded_cls"].to(device)
 
-    return model.to(device)
+            base = baseline_outputs(baseline, cls, patch)
+
+            out = reliability(
+                patch_features=patch,
+                patch_logits=base["patch_logits"],
+                global_logit=base["global_logit"],
+            )
+
+            for i, image_id in enumerate(batch["image_id"]):
+                writer.writerow(
+                    {
+                        "image_id": image_id,
+                        "label": int(label[i].item()),
+                        "baseline_aigc_probability": float(
+                            base["aigc_probability"][i].item()
+                        ),
+                        "reliability_aigc_probability": float(
+                            out["aigc_probability"][i].item()
+                        ),
+                        "mean_reliability": float(
+                            out["mean_reliability"][i].item()
+                        ),
+                    }
+                )
 
 
-# ---------------------------------------------------------------------
-# Basic command-line entry point
-# ---------------------------------------------------------------------
-
-def main() -> None:
-    """
-    Basic smoke entry point.
-
-    Real training is intentionally not fabricated here because the
-    actual SID-Set feature cache and Member 2 trained checkpoint
-    must be supplied before real training begins.
-    """
-
-    import argparse
-
+def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "TraceLens-R Member 3 reliability trainer"
-        )
+        description="TraceLens-R Member 3 reliability trainer"
     )
-
-    parser.add_argument(
-        "--device",
-        default="cpu",
-    )
-
-    parser.add_argument(
-        "--hidden-dim",
-        type=int,
-        default=128,
-    )
-
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.1,
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-3,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--checkpoint",
-        default=(
-            "checkpoints/"
-            "reliability.pt"
-        ),
+        default="checkpoints/baseline_real_final.pt",
+    )
+    parser.add_argument(
+        "--cache-root",
+        default=r"E:\TikTok_cache\features",
+    )
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--output",
+        default="checkpoints/reliability_final.pt",
     )
 
     args = parser.parse_args()
 
-    set_seed(args.seed)
+    seed_everything(args.seed)
+    device = torch.device(args.device)
 
-    device = torch.device(
-        args.device
+    print(f"[reliability] device={device}")
+    print(f"[reliability] cache_root={args.cache_root}")
+
+    baseline = load_baseline(args.checkpoint, device)
+
+    train_ds = PairedFeatureDataset(args.cache_root, "train")
+    val_ds = PairedFeatureDataset(args.cache_root, "val")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate,
     )
 
-    model = build_reliability_model(
-        device=device,
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate,
+    )
+
+    reliability = TraceLensReliability(
+        embed_dim=384,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-    )
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        reliability.parameters(),
         lr=args.lr,
     )
 
-    print(
-        "TraceLens-R Member 3 reliability "
-        "model initialized."
-    )
+    best_val = float("inf")
+    best_state = None
+    history = []
 
     print(
-        f"Device: {device}"
+        f"[reliability] train_pairs={len(train_ds)} "
+        f"val_pairs={len(val_ds)}"
     )
 
-    print(
-        "Trainable parameters:",
-        sum(
-            p.numel()
-            for p in model.parameters()
-            if p.requires_grad
-        ),
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = run_epoch(
+            reliability,
+            baseline,
+            train_loader,
+            optimizer,
+            device,
+            training=True,
+        )
+
+        val_metrics = run_epoch(
+            reliability,
+            baseline,
+            val_loader,
+            optimizer=None,
+            device=device,
+            training=False,
+        )
+
+        record = {
+            "epoch": epoch,
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+        history.append(record)
+
+        print(
+            f"[epoch {epoch:02d}] "
+            f"train_loss={train_metrics['loss']:.5f} "
+            f"val_loss={val_metrics['loss']:.5f} "
+            f"val_acc={val_metrics['accuracy']:.4f}"
+        )
+
+        if val_metrics["loss"] < best_val:
+            best_val = val_metrics["loss"]
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in reliability.state_dict().items()
+            }
+
+    if best_state is None:
+        raise RuntimeError("No best reliability checkpoint was selected")
+
+    reliability.load_state_dict(best_state)
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "model": reliability.cpu(),
+            "config": vars(args),
+            "best_val_loss": best_val,
+            "history": history,
+        },
+        output_path,
     )
 
-    print(
-        "Waiting for real SID-Set features "
-        "and Member 2 trained baseline checkpoint "
-        "before real training."
+    save_validation_predictions(
+        reliability.to(device),
+        baseline,
+        val_loader,
+        device,
+        Path("outputs/reliability_val_predictions.csv"),
     )
+
+    Path("outputs/reliability_training_log.json").write_text(
+        json.dumps(history, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"[reliability] saved: {output_path}")
+    print(f"[reliability] best_val_loss={best_val:.6f}")
+    print("[reliability] test set was NOT used")
 
 
 if __name__ == "__main__":
