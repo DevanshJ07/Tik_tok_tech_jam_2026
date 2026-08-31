@@ -17,6 +17,7 @@ datasets/
 data/datasets/
 data/raw/
 data/downloads/
+data/cache/
 *.jpg
 *.jpeg
 *.png

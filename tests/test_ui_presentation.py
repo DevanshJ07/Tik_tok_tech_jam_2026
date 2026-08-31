@@ -78,3 +78,19 @@ def test_mock_capabilities_are_testing_only() -> None:
     assert real_status["reliability"] == "awaiting Member 3 model"
     assert real_status["manipulation"] == "awaiting Member 4 model"
     assert real_status["heatmap"] == "awaiting Member 4 model"
+
+
+def test_capabilities_when_manipulation_connected(tmp_path: Path) -> None:
+    heat = tmp_path / "map.png"
+    heat.write_bytes(b"png")
+    result = PredictionResult(
+        image_path="a.png",
+        aigc_probability=0.2,
+        manipulation_probability=0.8,
+        heatmap_path=str(heat),
+    )
+    status = capability_status(mock=False, result=result)
+    assert status["aigc_predictor"] == "connected (baseline)"
+    assert status["reliability"] == "awaiting Member 3 model"
+    assert status["manipulation"] == "connected"
+    assert status["heatmap"] == "connected"

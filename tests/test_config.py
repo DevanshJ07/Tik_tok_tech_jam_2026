@@ -27,6 +27,7 @@ def test_valid_default_configuration_loads() -> None:
     assert config["paths"]["checkpoints_dir"]
     assert config["paths"]["outputs_dir"]
     assert config["inference"]["device"] == "cpu"
+    assert config["inference"]["manipulation_checkpoint"] == ""
 
 
 def test_invalid_fusion_weights_are_rejected(tmp_path: Path) -> None:

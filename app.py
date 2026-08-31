@@ -38,7 +38,7 @@ def main() -> None:
     _render_header()
 
     config = _safe_config()
-    mock_enabled, mock_acknowledged, threshold, checkpoint, device = _render_sidebar(config)
+    mock_enabled, mock_acknowledged, threshold, checkpoint, manipulation_checkpoint, device = _render_sidebar(config)
 
     if mock_enabled:
         st.markdown(
@@ -62,6 +62,7 @@ def main() -> None:
             mock_acknowledged=mock_acknowledged,
             threshold=threshold,
             checkpoint=checkpoint,
+            manipulation_checkpoint=manipulation_checkpoint,
             device=device,
             config=config,
         )
@@ -97,10 +98,11 @@ def _render_header() -> None:
     )
 
 
-def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str]:
+def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str, str]:
     model = config.get("model", {})
     inference = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
     configured_checkpoint = str(inference.get("checkpoint") or "")
+    configured_manipulation = str(inference.get("manipulation_checkpoint") or "")
     configured_device = str(inference.get("device") or "cpu")
     if configured_device not in {"cpu", "cuda"} and not configured_device.startswith("cuda:"):
         configured_device = "cpu"
@@ -113,6 +115,11 @@ def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str]:
         value=configured_checkpoint,
         help="Path to a Member 2 baseline .pt file. Required for real inference.",
     )
+    manipulation_checkpoint = st.sidebar.text_input(
+        "Manipulation checkpoint (optional)",
+        value=configured_manipulation,
+        help="Path to a Member 4 manipulation .pt file. Leave empty for baseline-only.",
+    )
     device_options = ["cpu", "cuda"]
     device_index = 0 if configured_device == "cpu" else 1
     device = st.sidebar.selectbox(
@@ -124,8 +131,8 @@ def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str]:
     threshold = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.01)
     st.sidebar.caption("Display threshold for the provisional model indication. Not a tuned operating point.")
     st.sidebar.caption(
-        "Reliability and manipulation await Member 3 and Member 4 models. "
-        "They are never invented from the baseline checkpoint."
+        "Reliability awaits Member 3. Manipulation is shown only when a genuine "
+        "Member 4 checkpoint is configured. Scores are never invented."
     )
 
     st.sidebar.header("Testing-only mock")
@@ -140,7 +147,14 @@ def _render_sidebar(config: dict) -> tuple[bool, bool, float, str, str]:
             "I acknowledge that mock results are not model predictions",
             value=False,
         )
-    return mock_enabled, mock_acknowledged, float(threshold), checkpoint, str(device)
+    return (
+        mock_enabled,
+        mock_acknowledged,
+        float(threshold),
+        checkpoint,
+        manipulation_checkpoint,
+        str(device),
+    )
 
 
 def _run_analysis(
@@ -150,6 +164,7 @@ def _run_analysis(
     mock_acknowledged: bool,
     threshold: float,
     checkpoint: str,
+    manipulation_checkpoint: str,
     device: str,
     config: dict,
 ) -> None:
@@ -163,6 +178,7 @@ def _run_analysis(
             mock_enabled=mock_enabled,
             mock_acknowledged=mock_acknowledged,
             checkpoint=checkpoint,
+            manipulation_checkpoint=manipulation_checkpoint,
             device=device,
             config=config,
         )
@@ -186,8 +202,8 @@ def _run_analysis(
         st.info(
             "The page remains usable. Upload still works. Mock mode will not "
             "turn on automatically. Set a valid baseline checkpoint path to "
-            "run TraceLensPredictor. Reliability and manipulation stay unavailable "
-            "until those models are connected."
+            "run TraceLensPredictor. Reliability stays unavailable until Member 3 "
+            "is connected. Manipulation requires a valid Member 4 checkpoint."
         )
     except (UploadError, PresentationError) as exc:
         st.error(str(exc))
@@ -248,8 +264,9 @@ def _render_capabilities(mock_enabled: bool, result_state: dict | None) -> None:
     )
     st.caption(
         "AIGC uses the Member 2 baseline through src/inference/factory.py. "
-        "Reliability (Member 3) and manipulation / heatmap (Member 4) are awaiting "
-        "their models. Optional modules must not change AIGC probability."
+        "Reliability awaits Member 3. Manipulation and heatmap appear only when "
+        "a genuine Member 4 checkpoint is attached. Optional modules must not "
+        "change AIGC probability."
     )
 
 

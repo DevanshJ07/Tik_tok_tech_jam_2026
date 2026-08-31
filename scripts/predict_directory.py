@@ -38,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
         "unless inference.checkpoint is set in --config.",
     )
     parser.add_argument(
+        "--manipulation-checkpoint",
+        default=None,
+        help="Optional Member 4 manipulation checkpoint (.pt). If set but "
+        "unreadable, the run fails instead of inventing manipulation scores.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="cpu (default) or cuda. CUDA is never implied.",
@@ -78,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             predictor = create_predictor(
                 mock=False,
                 checkpoint=args.checkpoint,
+                manipulation_checkpoint=args.manipulation_checkpoint,
                 device=args.device,
                 config=config,
             )

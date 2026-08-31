@@ -51,4 +51,5 @@ paths:
 
 inference:
   checkpoint: ""
+  manipulation_checkpoint: ""
   device: cpu

@@ -34,6 +34,7 @@ class InferenceSettings:
     checkpoint: Path
     device: str
     backbone_name: str
+    manipulation_checkpoint: Path | None = None
 
 
 def resolve_device(device: str | None) -> torch.device:
@@ -73,9 +74,31 @@ def resolve_checkpoint_path(
     )
 
 
+def resolve_manipulation_checkpoint_path(
+    manipulation_checkpoint: str | Path | None,
+    config: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Return a configured manipulation checkpoint, or None if it is optional/absent.
+
+    An explicitly passed value (including an empty string from the UI) is
+    authoritative and does not fall through to YAML.
+    """
+    if manipulation_checkpoint is not None:
+        stripped = str(manipulation_checkpoint).strip()
+        return Path(stripped) if stripped else None
+    if config is not None:
+        inference = config.get("inference") if isinstance(config, Mapping) else None
+        if isinstance(inference, Mapping):
+            configured = inference.get("manipulation_checkpoint")
+            if configured is not None and str(configured).strip():
+                return Path(str(configured).strip())
+    return None
+
+
 def resolve_inference_settings(
     *,
     checkpoint: str | Path | None = None,
+    manipulation_checkpoint: str | Path | None = None,
     device: str | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> InferenceSettings:
@@ -97,6 +120,9 @@ def resolve_inference_settings(
         checkpoint=resolved_checkpoint,
         device=resolved_device,
         backbone_name=backbone_name,
+        manipulation_checkpoint=resolve_manipulation_checkpoint_path(
+            manipulation_checkpoint, config
+        ),
     )
 
 

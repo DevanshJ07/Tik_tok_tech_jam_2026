@@ -52,6 +52,7 @@ __all__ = [
     "save_manipulation_checkpoint",
     "load_manipulation_checkpoint",
     "train_one_epoch",
+    "evaluate_manipulation_epoch",
 ]
 
 DEFAULT_DICE_EPSILON = 1e-6
@@ -484,3 +485,232 @@ def train_one_epoch(
         num_batches=num_batches,
         num_skipped_batches=num_skipped,
     )
+
+
+def evaluate_manipulation_epoch(
+    model: ManipulationHead,
+    batches: Iterable[Mapping[str, Tensor]],
+    *,
+    patch_grid_size: int = DEFAULT_PATCH_GRID_SIZE,
+    device: str | None = CPU_DEVICE,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """Compute validation metrics. Does not update parameters or look at test data."""
+    import numpy as np
+    from sklearn.metrics import (
+        balanced_accuracy_score,
+        brier_score_loss,
+        roc_auc_score,
+    )
+
+    torch_device = resolve_manipulation_device(device)
+    model.to(torch_device)
+    model.eval()
+    total_loss = 0.0
+    total_bce = 0.0
+    total_dice = 0.0
+    n_batches = 0
+    image_scores: list[float] = []
+    image_labels: list[int] = []
+    patch_inter = 0.0
+    patch_pred_sum = 0.0
+    patch_tgt_sum = 0.0
+    heat_inter = 0.0
+    heat_pred_sum = 0.0
+    heat_tgt_sum = 0.0
+
+    with torch.no_grad():
+        for batch in batches:
+            moved = _move_batch_tensors(batch, torch_device)
+            filtered = filter_manipulation_batch(
+                moved["patch_features"], moved["mask"], moved["label"]
+            )
+            if filtered is None:
+                continue
+            patch_features, mask, labels = filtered
+            output = model(patch_features)
+            loss = manipulation_loss(
+                output["patch_mask_logits"],
+                mask,
+                patch_grid_size=patch_grid_size,
+            )
+            total_loss += float(loss.total)
+            total_bce += float(loss.bce)
+            total_dice += float(loss.dice)
+            n_batches += 1
+
+            image_scores.extend(output["manipulation_probability"].detach().cpu().tolist())
+            binary_labels = (labels == manifests.LABEL_LOCALLY_TAMPERED).long().cpu().tolist()
+            image_labels.extend(binary_labels)
+
+            target_patches = resize_mask_to_patch_grid(mask, patch_grid_size=patch_grid_size)
+            pred_patches = (torch.sigmoid(output["patch_mask_logits"]) >= threshold).float()
+            patch_inter += float((pred_patches * target_patches).sum())
+            patch_pred_sum += float(pred_patches.sum())
+            patch_tgt_sum += float(target_patches.sum())
+
+            heatmap_prob = torch.sigmoid(output["heatmap"])
+            if mask.dim() == 3:
+                gt = mask.unsqueeze(1)
+            else:
+                gt = mask
+            if gt.shape[-2:] != heatmap_prob.shape[-2:]:
+                gt = F.interpolate(gt.float(), size=heatmap_prob.shape[-2:], mode="nearest")
+            pred_heat = (heatmap_prob >= threshold).float()
+            gt_bin = (gt >= 0.5).float()
+            heat_inter += float((pred_heat * gt_bin).sum())
+            heat_pred_sum += float(pred_heat.sum())
+            heat_tgt_sum += float(gt_bin.sum())
+
+    if n_batches == 0:
+        raise ValueError("No eligible validation batches.")
+
+    y_true = np.asarray(image_labels, dtype=int)
+    y_score = np.asarray(image_scores, dtype=float)
+    y_hat = (y_score >= threshold).astype(int)
+    auroc = None
+    if len(set(y_true.tolist())) > 1:
+        auroc = float(roc_auc_score(y_true, y_score))
+
+    def _dice(inter: float, pred_s: float, tgt_s: float) -> float:
+        return float((2.0 * inter) / (pred_s + tgt_s + 1e-6))
+
+    def _iou(inter: float, pred_s: float, tgt_s: float) -> float:
+        return float(inter / (pred_s + tgt_s - inter + 1e-6))
+
+    return {
+        "mean_total_loss": total_loss / n_batches,
+        "mean_bce_loss": total_bce / n_batches,
+        "mean_dice_loss": total_dice / n_batches,
+        "num_batches": float(n_batches),
+        "sample_count": float(len(y_true)),
+        "image_balanced_accuracy": float(balanced_accuracy_score(y_true, y_hat)),
+        "image_auroc": float("nan") if auroc is None else auroc,
+        "image_brier": float(brier_score_loss(y_true, y_score)),
+        "patch_dice": _dice(patch_inter, patch_pred_sum, patch_tgt_sum),
+        "patch_iou": _iou(patch_inter, patch_pred_sum, patch_tgt_sum),
+        "heatmap_dice": _dice(heat_inter, heat_pred_sum, heat_tgt_sum),
+        "heatmap_iou": _iou(heat_inter, heat_pred_sum, heat_tgt_sum),
+        "threshold": threshold,
+    }
+
+
+def _build_train_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Train the TraceLens-R manipulation head on cached patch features."
+    )
+    parser.add_argument(
+        "--cache-dir",
+        required=True,
+        help="Root with clean/train and clean/val subdirectories "
+        "(e.g. data/cache/manipulation).",
+    )
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default=CPU_DEVICE)
+    parser.add_argument("--out-dir", type=str, default="checkpoints")
+    parser.add_argument("--run-name", type=str, default="manipulation_real")
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--top-k", type=int, default=16)
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> dict[str, Any]:
+    """Operational CLI. Model/loss semantics stay those of train_one_epoch."""
+    import random
+    import shutil
+    import time
+
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    from src.training.manipulation_cache import CachedManipulationDataset
+
+    args = _build_train_parser().parse_args(argv)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    cache_root = Path(args.cache_dir)
+    train_ds = CachedManipulationDataset(cache_root / "clean" / "train")
+    val_ds = CachedManipulationDataset(cache_root / "clean" / "val")
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+
+    model = ManipulationHead(hidden_dim=args.hidden_dim, top_k=args.top_k)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    history: list[dict[str, Any]] = []
+    best_path: Path | None = None
+    best_val_loss = float("inf")
+    best_epoch = -1
+    t0 = time.time()
+    print(
+        f"[manip] train_n={len(train_ds)} val_n={len(val_ds)} "
+        f"epochs={args.epochs} device={args.device} seed={args.seed}",
+        flush=True,
+    )
+
+    for epoch in range(args.epochs):
+        stats = train_one_epoch(model, train_loader, optimizer, device=args.device)
+        val_metrics = evaluate_manipulation_epoch(model, val_loader, device=args.device)
+        ckpt_path = out_dir / f"{args.run_name}_epoch{epoch}.pt"
+        save_manipulation_checkpoint(
+            ckpt_path,
+            model=model,
+            epoch=epoch + 1,
+            optimizer=optimizer,
+            extra={"val_metrics": val_metrics, "train_stats": vars(stats)},
+        )
+        row = {
+            "epoch": epoch,
+            "train_loss": stats.mean_total_loss,
+            "val_loss": val_metrics["mean_total_loss"],
+            "val_image_auroc": val_metrics["image_auroc"],
+            "val_image_balanced_accuracy": val_metrics["image_balanced_accuracy"],
+            "val_patch_dice": val_metrics["patch_dice"],
+            "checkpoint": str(ckpt_path),
+        }
+        history.append(row)
+        print(
+            f"[manip] epoch {epoch} train_loss={stats.mean_total_loss:.4f} "
+            f"val_loss={val_metrics['mean_total_loss']:.4f} "
+            f"val_auroc={val_metrics['image_auroc']:.4f} "
+            f"val_bal_acc={val_metrics['image_balanced_accuracy']:.4f} "
+            f"patch_dice={val_metrics['patch_dice']:.4f}",
+            flush=True,
+        )
+        if val_metrics["mean_total_loss"] < best_val_loss:
+            best_val_loss = val_metrics["mean_total_loss"]
+            best_epoch = epoch
+            best_path = ckpt_path
+
+    if best_path is None:
+        raise RuntimeError("No manipulation checkpoint was selected.")
+    final_path = out_dir / f"{args.run_name}_final.pt"
+    shutil.copy2(best_path, final_path)
+    elapsed = time.time() - t0
+    summary = {
+        "selected_epoch": best_epoch,
+        "selected_checkpoint": str(best_path),
+        "final_checkpoint": str(final_path),
+        "selection_metric": "val_mean_total_loss",
+        "best_val_loss": best_val_loss,
+        "history": history,
+        "elapsed_seconds": elapsed,
+        "train_size": len(train_ds),
+        "val_size": len(val_ds),
+    }
+    print(f"[manip] selected epoch={best_epoch} val_loss={best_val_loss:.4f} -> {final_path}", flush=True)
+    print(f"[manip] elapsed={elapsed:.1f}s summary={summary}", flush=True)
+    return summary
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
