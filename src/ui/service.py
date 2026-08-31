@@ -39,6 +39,7 @@ def resolve_predictor(
     mock_enabled: bool,
     mock_acknowledged: bool,
     checkpoint: str | Path | None = None,
+    manipulation_checkpoint: str | Path | None = None,
     device: str | None = None,
     config: dict | None = None,
     backbone: DINOv2Backbone | None = None,
@@ -54,6 +55,7 @@ def resolve_predictor(
     return create_predictor(
         mock=False,
         checkpoint=checkpoint,
+        manipulation_checkpoint=manipulation_checkpoint,
         device=device,
         config=config,
         backbone=backbone,

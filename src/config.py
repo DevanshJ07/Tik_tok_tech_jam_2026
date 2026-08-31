@@ -114,6 +114,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
         checkpoint = inference.get("checkpoint", "")
         if checkpoint is not None and not isinstance(checkpoint, (str, Path)):
             raise ConfigError("inference.checkpoint must be a path string.")
+        manipulation_checkpoint = inference.get("manipulation_checkpoint", "")
+        if manipulation_checkpoint is not None and not isinstance(
+            manipulation_checkpoint, (str, Path)
+        ):
+            raise ConfigError("inference.manipulation_checkpoint must be a path string.")
 
 
 def _require_key(mapping: Mapping[str, Any], key: str, prefix: str = "") -> Any:

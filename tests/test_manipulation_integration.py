@@ -251,3 +251,118 @@ def test_predictor_aigc_unchanged_when_adapter_attached(tmp_path: Path) -> None:
     assert isinstance(with_mod, PredictionResult)
     factory_mock = create_predictor(mock=True)
     assert factory_mock.predict(image).to_official_record().keys() == {"image_path", "pred"}
+
+
+def _write_manipulation_checkpoint(path: Path) -> Path:
+    head = ManipulationHead()
+    save_manipulation_checkpoint(path, model=head, epoch=1)
+    return path
+
+
+def test_factory_empty_manipulation_checkpoint_stays_absent(tmp_path: Path) -> None:
+    baseline = _write_baseline_checkpoint(tmp_path / "baseline.pt")
+    predictor = create_predictor(
+        mock=False,
+        checkpoint=baseline,
+        manipulation_checkpoint="",
+        config={
+            "inference": {
+                "checkpoint": str(baseline),
+                "manipulation_checkpoint": str(tmp_path / "should-not-load.pt"),
+                "device": "cpu",
+            }
+        },
+        backbone=_stub_backbone(),
+    )
+    assert isinstance(predictor, TraceLensPredictor)
+    assert predictor.manipulation_module is None
+
+
+def test_factory_attaches_manipulation_checkpoint(tmp_path: Path) -> None:
+    from src.inference.predictor import MockPredictor
+
+    baseline = _write_baseline_checkpoint(tmp_path / "baseline.pt")
+    manip = _write_manipulation_checkpoint(tmp_path / "manip.pt")
+    image = _rgb(tmp_path / "photo.png")
+    backbone = _stub_backbone()
+    without = create_predictor(
+        mock=False, checkpoint=baseline, backbone=backbone
+    )
+    assert without.manipulation_module is None
+    with_mod = create_predictor(
+        mock=False,
+        checkpoint=baseline,
+        manipulation_checkpoint=manip,
+        backbone=backbone,
+    )
+    assert not isinstance(with_mod, MockPredictor)
+    assert isinstance(with_mod, TraceLensPredictor)
+    assert with_mod.manipulation_module is not None
+    r0 = without.predict(image)
+    r1 = with_mod.predict(image)
+    assert r0.aigc_probability == r1.aigc_probability
+    assert 0.0 <= r1.manipulation_probability <= 1.0
+    assert r1.heatmap_path is not None
+    assert Path(r1.heatmap_path).is_file()
+    Image.open(r1.heatmap_path).verify()
+    assert r1.reliability_score is None
+    assert set(r1.to_official_record().keys()) == {"image_path", "pred"}
+    assert with_mod.device.type == "cpu"
+
+
+def test_factory_missing_manipulation_checkpoint_raises(tmp_path: Path) -> None:
+    from src.inference.factory import RealModelUnavailableError
+
+    baseline = _write_baseline_checkpoint(tmp_path / "baseline.pt")
+    with pytest.raises(RealModelUnavailableError, match="Manipulation checkpoint"):
+        create_predictor(
+            mock=False,
+            checkpoint=baseline,
+            manipulation_checkpoint=tmp_path / "missing.pt",
+            backbone=_stub_backbone(),
+        )
+
+
+def test_factory_corrupt_manipulation_checkpoint_raises(tmp_path: Path) -> None:
+    from src.inference.factory import RealModelUnavailableError
+
+    baseline = _write_baseline_checkpoint(tmp_path / "baseline.pt")
+    bad = tmp_path / "bad.pt"
+    bad.write_bytes(b"not-a-checkpoint")
+    with pytest.raises(RealModelUnavailableError, match="Manipulation checkpoint"):
+        create_predictor(
+            mock=False,
+            checkpoint=baseline,
+            manipulation_checkpoint=bad,
+            backbone=_stub_backbone(),
+        )
+
+
+def test_factory_incompatible_manipulation_checkpoint_raises(tmp_path: Path) -> None:
+    from src.inference.factory import RealModelUnavailableError
+
+    baseline = _write_baseline_checkpoint(tmp_path / "baseline.pt")
+    bad = tmp_path / "incompatible.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "kind": "manipulation_head",
+            "model_state_dict": ManipulationHead(
+                embedding_dim=16, hidden_dim=8, patch_grid_size=4, top_k=2
+            ).state_dict(),
+            "model_hparams": {
+                "embedding_dim": 16,
+                "patch_grid_size": 4,
+                "hidden_dim": 8,
+                "top_k": 2,
+            },
+        },
+        bad,
+    )
+    with pytest.raises(RealModelUnavailableError, match="Manipulation checkpoint"):
+        create_predictor(
+            mock=False,
+            checkpoint=baseline,
+            manipulation_checkpoint=bad,
+            backbone=_stub_backbone(),
+        )
